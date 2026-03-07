@@ -1035,6 +1035,15 @@ defmodule ClaudeAgentSDK.Client do
   end
 
   @impl true
+  def handle_info({:transport_stderr, data}, state) do
+    if is_function(state.options.stderr, 1) do
+      state.options.stderr.(data)
+    end
+
+    {:noreply, state}
+  end
+
+  @impl true
   def handle_info({:transport_error, error}, state) do
     message = transport_error_message(error)
 
