@@ -8,15 +8,19 @@ defmodule ClaudeAgentSDK.JSON do
 
   @spec decode(String.t()) :: {:ok, term()} | {:error, :invalid_json}
   def decode(json_string) when is_binary(json_string) do
-    if function_exported?(:json, :decode, 1) do
+    if function_exported?(:json, :decode, 3) do
       decode_with_otp(json_string)
     else
       decode_with_jason(json_string)
     end
   end
 
+  # OTP's :json.decode/1 returns the atom `:null` for JSON null, which does not
+  # round-trip through downstream schema validators (Zoi treats only `nil` as
+  # nullish). Use the decoder form that maps `null` -> `nil`.
   defp decode_with_otp(json_string) do
-    {:ok, :json.decode(json_string)}
+    {decoded, :ok, ""} = :json.decode(json_string, :ok, %{null: nil})
+    {:ok, decoded}
   rescue
     _error ->
       {:error, :invalid_json}
