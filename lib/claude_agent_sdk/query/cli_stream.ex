@@ -108,7 +108,7 @@ defmodule ClaudeAgentSDK.Query.CLIStream do
              [
                receiver: self(),
                event_tag: @transport_event_tag,
-               stderr_callback: nil,
+               stderr_callback: options.stderr,
                stdout_mode: :line,
                stdin_mode: :line
              ] ++
