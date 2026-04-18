@@ -109,7 +109,7 @@ defmodule ClaudeAgentSDK.Query.CLIStream do
                command: CoreCommand.to_transport_command(command),
                subscriber: {self(), transport_ref},
                event_tag: @transport_event_tag,
-               stderr_callback: nil
+               stderr_callback: options.stderr
              ] ++
                Options.execution_surface_options(options)
            ),
