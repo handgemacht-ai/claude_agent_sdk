@@ -28,6 +28,8 @@ defmodule ClaudeAgentSDK.SidecarSession do
       :hook_handler,
       :mcp_handler,
       :can_use_tool_handler,
+      :hook_subscriptions,
+      :mcp_tools,
       status: :new,
       subscribers: [],
       messages: [],
@@ -125,7 +127,9 @@ defmodule ClaudeAgentSDK.SidecarSession do
       options: options,
       hook_handler: Keyword.get(opts, :hook_handler),
       mcp_handler: Keyword.get(opts, :mcp_handler),
-      can_use_tool_handler: Keyword.get(opts, :can_use_tool_handler)
+      can_use_tool_handler: Keyword.get(opts, :can_use_tool_handler),
+      hook_subscriptions: Keyword.get(opts, :hook_subscriptions, []),
+      mcp_tools: Keyword.get(opts, :mcp_tools, [])
     }
 
     {:ok, state, {:continue, :register}}
@@ -157,11 +161,14 @@ defmodule ClaudeAgentSDK.SidecarSession do
   end
 
   def handle_call(:create, _from, %{status: :new} = state) do
-    params = %{
-      sessionId: state.session_id,
-      options: state.options,
-      permissionBridge: not is_nil(state.can_use_tool_handler)
-    }
+    params =
+      %{
+        sessionId: state.session_id,
+        options: state.options,
+        permissionBridge: not is_nil(state.can_use_tool_handler)
+      }
+      |> maybe_put_list(:hookSubscriptions, state.hook_subscriptions)
+      |> maybe_put_list(:mcpTools, state.mcp_tools)
 
     case Worker.call_rpc(state.worker, Protocol.method_session_create(), params) do
       {:ok, %{"sessionId" => sid, "createdAt" => at}} ->
@@ -342,6 +349,10 @@ defmodule ClaudeAgentSDK.SidecarSession do
 
   defp normalize_permission_result({:deny, msg}), do: %{behavior: "deny", message: msg}
   defp normalize_permission_result(_), do: %{behavior: "allow"}
+
+  defp maybe_put_list(map, _key, nil), do: map
+  defp maybe_put_list(map, _key, []), do: map
+  defp maybe_put_list(map, key, list) when is_list(list), do: Map.put(map, key, list)
 
   defp generate_session_id do
     <<a::32, b::16, c::16, d::16, e::48>> = :crypto.strong_rand_bytes(16)

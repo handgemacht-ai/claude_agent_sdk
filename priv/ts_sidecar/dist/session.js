@@ -12,7 +12,7 @@
  */
 import { createRequire } from "node:module";
 import { send } from "./framing.js";
-import { NOTIF_SESSION_CLOSED, NOTIF_SESSION_ERROR, NOTIF_SESSION_MESSAGE, METHOD_CAN_USE_TOOL, } from "./protocol.js";
+import { NOTIF_SESSION_CLOSED, NOTIF_SESSION_ERROR, NOTIF_SESSION_MESSAGE, METHOD_CAN_USE_TOOL, METHOD_HOOK_FIRE, METHOD_MCP_CALL, } from "./protocol.js";
 export const CONTROL_METHODS = [
     "interrupt",
     "setPermissionMode",
@@ -97,7 +97,7 @@ export class QuerySession {
     async create(params) {
         this.sessionId = params.sessionId;
         this.input = makeInputChannel();
-        const options = this.enrichOptions(params.options, params.permissionBridge ?? false);
+        const options = this.enrichOptions(params.options, params);
         this.query = this.sdk.query({ prompt: this.input.iterable, options });
         this.createdAt = new Date().toISOString();
         this.pumpDone = this.pump();
@@ -137,7 +137,10 @@ export class QuerySession {
         }
         this.input = makeInputChannel();
         const merged = { ...options, resume: sdkSessionId };
-        const enriched = this.enrichOptions(merged, false);
+        const enriched = this.enrichOptions(merged, {
+            sessionId: this.sessionId,
+            options: merged,
+        });
         this.query = this.sdk.query({ prompt: this.input.iterable, options: enriched });
         this.closed = false;
         this.pumpDone = this.pump();
@@ -196,23 +199,93 @@ export class QuerySession {
         }
     }
     /**
-     * Inject a canUseTool proxy that forwards decisions back to Elixir, if the
-     * caller opted in. We intentionally do not mutate the caller's hooks/options
-     * further — everything else is passed through as the SDK expects.
+     * Inject Elixir-owned bridges into the SDK options:
+     *   • `canUseTool` — when `permissionBridge` is set, every prompt for
+     *     tool permission goes back to Elixir via `can_use_tool` RPC.
+     *   • `hooks` — each declared subscription becomes an SDK HookCallback
+     *     that fires `hook.fire` RPC and relays the decision.
+     *   • `mcpServers` — each declared tool is grouped by server and
+     *     exposed via `createSdkMcpServer`, with handlers proxying
+     *     through `mcp.call` RPC.
      */
-    enrichOptions(options, permissionBridge) {
-        if (!permissionBridge)
-            return options;
-        const canUseTool = async (toolName, input) => {
-            const res = await this.rpc.call(METHOD_CAN_USE_TOOL, {
+    enrichOptions(options, params) {
+        let enriched = { ...options };
+        if (params.permissionBridge) {
+            enriched.canUseTool = this.makeCanUseTool();
+        }
+        if (params.hookSubscriptions && params.hookSubscriptions.length > 0) {
+            const hooks = this.makeHooks(params.hookSubscriptions);
+            const existing = enriched.hooks ?? {};
+            enriched.hooks = mergeHooks(existing, hooks);
+        }
+        if (params.mcpTools && params.mcpTools.length > 0) {
+            const servers = this.makeMcpServers(params.mcpTools);
+            const existing = enriched.mcpServers ?? {};
+            enriched.mcpServers = { ...existing, ...servers };
+        }
+        return enriched;
+    }
+    makeCanUseTool() {
+        return async (toolName, input) => {
+            return await this.rpc.call(METHOD_CAN_USE_TOOL, {
                 sessionId: this.sessionId,
                 toolName,
                 input,
             });
-            return res;
         };
-        return { ...options, canUseTool };
     }
+    makeHooks(subs) {
+        const out = {};
+        for (const s of subs) {
+            const cb = async (input, toolUseId) => {
+                const res = await this.rpc.call(METHOD_HOOK_FIRE, {
+                    sessionId: this.sessionId,
+                    event: s.event,
+                    payload: { ...input, toolUseId },
+                });
+                return res;
+            };
+            const matcher = {
+                matcher: s.matcher,
+                hooks: [cb],
+                timeout: s.timeout,
+            };
+            (out[s.event] ??= []).push(matcher);
+        }
+        return out;
+    }
+    makeMcpServers(tools) {
+        const byServer = new Map();
+        for (const t of tools) {
+            const list = byServer.get(t.server) ?? [];
+            list.push(t);
+            byServer.set(t.server, list);
+        }
+        const servers = {};
+        for (const [serverName, specs] of byServer) {
+            const sdkTools = specs.map((spec) => this.sdk.tool(spec.name, spec.description, spec.inputSchema ?? {}, async (args) => this.proxyMcpCall(serverName, spec.name, args)));
+            servers[serverName] = this.sdk.createSdkMcpServer({
+                name: serverName,
+                tools: sdkTools,
+            });
+        }
+        return servers;
+    }
+    async proxyMcpCall(server, tool, args) {
+        return await this.rpc.call(METHOD_MCP_CALL, {
+            sessionId: this.sessionId,
+            server,
+            tool,
+            args,
+        });
+    }
+}
+function mergeHooks(a, b) {
+    const out = { ...a };
+    for (const [k, v] of Object.entries(b)) {
+        out[k] = [...(out[k] ?? []), ...v];
+    }
+    return out;
 }
 export async function buildSession() {
     const mod = (await import("@anthropic-ai/claude-agent-sdk"));

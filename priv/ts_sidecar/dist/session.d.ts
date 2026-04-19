@@ -45,11 +45,28 @@ type QueryHandle = AsyncGenerator<SdkMessage, void> & {
     stopTask(taskId: string): Promise<void>;
     close(): void;
 };
+type SdkMcpToolDefinition = {
+    name: string;
+    description: string;
+    inputSchema: Record<string, unknown>;
+    handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown>;
+};
+type McpSdkServerConfigWithInstance = {
+    type: "sdk";
+    name: string;
+    instance: unknown;
+};
 type SdkModule = {
     query: (params: {
         prompt: AsyncIterable<SdkUserMessage>;
         options?: unknown;
     }) => QueryHandle;
+    createSdkMcpServer: (opts: {
+        name: string;
+        version?: string;
+        tools?: SdkMcpToolDefinition[];
+    }) => McpSdkServerConfigWithInstance;
+    tool: (name: string, description: string, inputSchema: Record<string, unknown>, handler: (args: Record<string, unknown>, extra: unknown) => Promise<unknown>) => SdkMcpToolDefinition;
 };
 export declare const CONTROL_METHODS: readonly ["interrupt", "setPermissionMode", "setModel", "applyFlagSettings", "initializationResult", "supportedCommands", "supportedModels", "supportedAgents", "mcpServerStatus", "getContextUsage", "reloadPlugins", "accountInfo", "rewindFiles", "seedReadState", "reconnectMcpServer", "toggleMcpServer", "setMcpServers", "stopTask"];
 export declare class QuerySession {
@@ -72,11 +89,20 @@ export declare class QuerySession {
     private nextTurnId;
     private pump;
     /**
-     * Inject a canUseTool proxy that forwards decisions back to Elixir, if the
-     * caller opted in. We intentionally do not mutate the caller's hooks/options
-     * further — everything else is passed through as the SDK expects.
+     * Inject Elixir-owned bridges into the SDK options:
+     *   • `canUseTool` — when `permissionBridge` is set, every prompt for
+     *     tool permission goes back to Elixir via `can_use_tool` RPC.
+     *   • `hooks` — each declared subscription becomes an SDK HookCallback
+     *     that fires `hook.fire` RPC and relays the decision.
+     *   • `mcpServers` — each declared tool is grouped by server and
+     *     exposed via `createSdkMcpServer`, with handlers proxying
+     *     through `mcp.call` RPC.
      */
     private enrichOptions;
+    private makeCanUseTool;
+    private makeHooks;
+    private makeMcpServers;
+    private proxyMcpCall;
 }
 export interface ModeInfo {
     sdkVersion: string;

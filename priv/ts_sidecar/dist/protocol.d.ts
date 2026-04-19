@@ -51,8 +51,39 @@ export interface SessionCreateParams {
     options: Record<string, unknown>;
     /** When true, Elixir wants `can_use_tool` RPC calls routed back. */
     permissionBridge?: boolean;
-    /** Names of hook events Elixir wants to be notified about (future use). */
-    hookEvents?: string[];
+    /**
+     * Hook subscriptions Elixir wants SDK-native hook callbacks for. Each entry
+     * becomes an SDK `HookCallback` that, on fire, sends `hook.fire` back to
+     * Elixir and returns whatever the handler decides.
+     */
+    hookSubscriptions?: HookSubscription[];
+    /**
+     * MCP tools Elixir wants exposed to the SDK. Each entry is grouped by
+     * `server` into a single `createSdkMcpServer` with one tool per entry.
+     * When invoked, each tool proxies via `mcp.call` back to Elixir.
+     */
+    mcpTools?: McpToolSpec[];
+}
+export interface HookSubscription {
+    /** SDK HookEvent name, e.g. "PreToolUse", "PostToolUse". */
+    event: string;
+    /** Optional tool-name matcher, e.g. "Bash", passed to HookCallbackMatcher. */
+    matcher?: string;
+    /** Optional per-matcher timeout (seconds). */
+    timeout?: number;
+}
+export interface McpToolSpec {
+    /** Logical MCP server name. Tools with the same `server` are grouped. */
+    server: string;
+    /** Tool name exposed to the model. */
+    name: string;
+    /** Human-readable description for the model. */
+    description: string;
+    /**
+     * JSON-Schema-style object describing tool inputs. The sidecar converts
+     * this to a permissive Zod shape; Elixir is authoritative for validation.
+     */
+    inputSchema?: Record<string, unknown>;
 }
 export interface SessionCreateResult {
     sessionId: SessionId;
