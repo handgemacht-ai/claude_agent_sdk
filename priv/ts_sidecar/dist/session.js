@@ -1,121 +1,227 @@
 /**
- * Per-session wrapper around the TS Agent SDK.
+ * Sidecar session built on the stable `query()` API.
  *
- * One `unstable_v2_createSession` handle per logical Elixir session. The
- * Elixir-generated `sessionId` is the demux key on the wire — it is NOT
- * passed to the SDK (the SDK generates its own). We retain the SDK's
- * sessionId in `sdkSessionId` in case a caller needs it (e.g. resume).
+ * Design:
+ *   • One `query()` per logical Elixir session. Streaming input enables
+ *     multi-turn conversations and unlocks the full `Query` control
+ *     surface (getContextUsage, supportedAgents, setModel, etc.).
+ *   • A pushable async iterable feeds user messages into the query.
+ *   • Every SDK message is forwarded verbatim as `session.message`.
+ *   • Control methods are routed through `CONTROL_METHODS` — any
+ *     method listed here can be invoked via `session.control` RPC.
  */
 import { createRequire } from "node:module";
 import { send } from "./framing.js";
-import { NOTIF_STREAM_END, NOTIF_STREAM_ERROR, NOTIF_STREAM_MESSAGE, } from "./protocol.js";
-export class RealSession {
+import { NOTIF_SESSION_CLOSED, NOTIF_SESSION_ERROR, NOTIF_SESSION_MESSAGE, METHOD_CAN_USE_TOOL, } from "./protocol.js";
+export const CONTROL_METHODS = [
+    "interrupt",
+    "setPermissionMode",
+    "setModel",
+    "applyFlagSettings",
+    "initializationResult",
+    "supportedCommands",
+    "supportedModels",
+    "supportedAgents",
+    "mcpServerStatus",
+    "getContextUsage",
+    "reloadPlugins",
+    "accountInfo",
+    "rewindFiles",
+    "seedReadState",
+    "reconnectMcpServer",
+    "toggleMcpServer",
+    "setMcpServers",
+    "stopTask",
+];
+function isControlMethod(name) {
+    return CONTROL_METHODS.includes(name);
+}
+function makeInputChannel() {
+    const queue = [];
+    const resolvers = [];
+    let closed = false;
+    const iterable = {
+        [Symbol.asyncIterator]() {
+            return {
+                next() {
+                    if (queue.length > 0) {
+                        return Promise.resolve({ value: queue.shift(), done: false });
+                    }
+                    if (closed)
+                        return Promise.resolve({ value: undefined, done: true });
+                    return new Promise((resolve) => resolvers.push(resolve));
+                },
+                return() {
+                    closed = true;
+                    while (resolvers.length)
+                        resolvers.shift()({ value: undefined, done: true });
+                    return Promise.resolve({ value: undefined, done: true });
+                },
+            };
+        },
+    };
+    return {
+        iterable,
+        push(msg) {
+            if (closed)
+                throw new Error("input channel closed");
+            const r = resolvers.shift();
+            if (r)
+                r({ value: msg, done: false });
+            else
+                queue.push(msg);
+        },
+        close() {
+            closed = true;
+            while (resolvers.length)
+                resolvers.shift()({ value: undefined, done: true });
+        },
+    };
+}
+export class QuerySession {
     sdk;
-    _rpc;
-    handle;
+    rpc;
+    out;
+    query;
+    input;
     sessionId;
-    sdkSessionId = null;
     createdAt;
-    options = {};
     closed = false;
-    cancelled = new Set();
-    constructor(sdk, _rpc) {
+    pumpDone;
+    turnSeq = 0;
+    constructor(sdk, rpc, out) {
         this.sdk = sdk;
-        this._rpc = _rpc;
+        this.rpc = rpc;
+        this.out = out;
     }
     async create(params) {
         this.sessionId = params.sessionId;
-        this.options = params.options ?? {};
-        this.handle = this.sdk.unstable_v2_createSession(this.options);
+        this.input = makeInputChannel();
+        const options = this.enrichOptions(params.options, params.permissionBridge ?? false);
+        this.query = this.sdk.query({ prompt: this.input.iterable, options });
         this.createdAt = new Date().toISOString();
-        return { sessionId: params.sessionId, createdAt: this.createdAt };
+        this.pumpDone = this.pump();
+        return { sessionId: this.sessionId, createdAt: this.createdAt };
     }
-    async send(message) {
+    async send(content, turnId) {
         if (this.closed)
             throw new Error("session closed");
-        const text = typeof message.content === "string"
-            ? message.content
-            : JSON.stringify(message);
-        await this.handle.send(text);
+        const assigned = turnId ?? this.nextTurnId();
+        this.input.push({
+            type: "user",
+            message: { role: "user", content },
+            parent_tool_use_id: null,
+        });
+        return assigned;
     }
-    async stream(streamId, out) {
+    async control(method, args) {
         if (this.closed)
             throw new Error("session closed");
+        if (!isControlMethod(method)) {
+            throw new Error(`unknown control method: ${method}`);
+        }
+        const handle = this.query;
+        const fn = handle[method];
+        if (typeof fn !== "function") {
+            throw new Error(`Query does not expose ${method}`);
+        }
+        return await fn.apply(this.query, args ?? []);
+    }
+    async resume(sdkSessionId, options) {
+        this.input.close();
         try {
-            for await (const msg of this.handle.stream()) {
-                if (this.cancelled.has(streamId))
-                    break;
-                this.captureSdkSessionId(msg);
-                send(out, {
-                    jsonrpc: "2.0",
-                    method: NOTIF_STREAM_MESSAGE,
-                    params: { sessionId: this.sessionId, streamId, message: msg },
-                });
-            }
-            send(out, {
-                jsonrpc: "2.0",
-                method: NOTIF_STREAM_END,
-                params: {
-                    sessionId: this.sessionId,
-                    streamId,
-                    reason: this.cancelled.has(streamId) ? "cancelled" : "message_stop",
-                },
-            });
+            this.query.close();
         }
-        catch (err) {
-            send(out, {
-                jsonrpc: "2.0",
-                method: NOTIF_STREAM_ERROR,
-                params: {
-                    sessionId: this.sessionId,
-                    streamId,
-                    error: { code: -32003, message: err.message },
-                },
-            });
+        catch {
+            /* fine */
         }
-    }
-    cancelStream(streamId) {
-        this.cancelled.add(streamId);
+        this.input = makeInputChannel();
+        const merged = { ...options, resume: sdkSessionId };
+        const enriched = this.enrichOptions(merged, false);
+        this.query = this.sdk.query({ prompt: this.input.iterable, options: enriched });
+        this.closed = false;
+        this.pumpDone = this.pump();
     }
     async close() {
-        if (!this.closed) {
-            try {
-                this.handle.close();
-            }
-            catch {
-                /* closing a dead handle is fine */
-            }
-            this.closed = true;
-        }
-    }
-    async resume(options = {}) {
-        if (!this.sdk.unstable_v2_resumeSession) {
-            throw new Error("installed SDK has no unstable_v2_resumeSession");
-        }
-        const resumeId = this.sdkSessionId;
-        if (!resumeId) {
-            throw new Error("no upstream sessionId captured yet — stream at least one message first");
-        }
-        this.handle = this.sdk.unstable_v2_resumeSession(resumeId, { ...this.options, ...options });
-        this.closed = false;
-    }
-    captureSdkSessionId(msg) {
-        if (this.sdkSessionId)
+        if (this.closed)
             return;
-        const id = msg.session_id;
-        if (typeof id === "string")
-            this.sdkSessionId = id;
+        this.closed = true;
+        this.input.close();
+        try {
+            this.query.close();
+        }
+        catch {
+            /* fine */
+        }
+        try {
+            await this.pumpDone;
+        }
+        catch {
+            /* pump resolves on close */
+        }
+    }
+    nextTurnId() {
+        this.turnSeq += 1;
+        return `turn-${this.turnSeq}`;
+    }
+    async pump() {
+        try {
+            for await (const msg of this.query) {
+                if (this.closed)
+                    break;
+                send(this.out, {
+                    jsonrpc: "2.0",
+                    method: NOTIF_SESSION_MESSAGE,
+                    params: { sessionId: this.sessionId, message: msg },
+                });
+            }
+            if (!this.closed) {
+                send(this.out, {
+                    jsonrpc: "2.0",
+                    method: NOTIF_SESSION_CLOSED,
+                    params: { sessionId: this.sessionId, reason: "iterator_done" },
+                });
+                this.closed = true;
+            }
+        }
+        catch (err) {
+            send(this.out, {
+                jsonrpc: "2.0",
+                method: NOTIF_SESSION_ERROR,
+                params: {
+                    sessionId: this.sessionId,
+                    error: { code: -32010, message: err.message },
+                },
+            });
+        }
+    }
+    /**
+     * Inject a canUseTool proxy that forwards decisions back to Elixir, if the
+     * caller opted in. We intentionally do not mutate the caller's hooks/options
+     * further — everything else is passed through as the SDK expects.
+     */
+    enrichOptions(options, permissionBridge) {
+        if (!permissionBridge)
+            return options;
+        const canUseTool = async (toolName, input) => {
+            const res = await this.rpc.call(METHOD_CAN_USE_TOOL, {
+                sessionId: this.sessionId,
+                toolName,
+                input,
+            });
+            return res;
+        };
+        return { ...options, canUseTool };
     }
 }
 export async function buildSession() {
     const mod = (await import("@anthropic-ai/claude-agent-sdk"));
-    if (typeof mod.unstable_v2_createSession !== "function") {
-        throw new Error("installed @anthropic-ai/claude-agent-sdk does not expose unstable_v2_createSession");
+    if (typeof mod.query !== "function") {
+        throw new Error("installed @anthropic-ai/claude-agent-sdk does not export query()");
     }
-    const version = readSdkVersion();
     return {
-        make: (rpc) => new RealSession(mod, rpc),
-        info: { sdkVersion: version },
+        make: (rpc, out) => new QuerySession(mod, rpc, out),
+        info: { sdkVersion: readSdkVersion() },
     };
 }
 function readSdkVersion() {

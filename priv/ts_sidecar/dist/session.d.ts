@@ -1,56 +1,88 @@
 /**
- * Per-session wrapper around the TS Agent SDK.
+ * Sidecar session built on the stable `query()` API.
  *
- * One `unstable_v2_createSession` handle per logical Elixir session. The
- * Elixir-generated `sessionId` is the demux key on the wire — it is NOT
- * passed to the SDK (the SDK generates its own). We retain the SDK's
- * sessionId in `sdkSessionId` in case a caller needs it (e.g. resume).
+ * Design:
+ *   • One `query()` per logical Elixir session. Streaming input enables
+ *     multi-turn conversations and unlocks the full `Query` control
+ *     surface (getContextUsage, supportedAgents, setModel, etc.).
+ *   • A pushable async iterable feeds user messages into the query.
+ *   • Every SDK message is forwarded verbatim as `session.message`.
+ *   • Control methods are routed through `CONTROL_METHODS` — any
+ *     method listed here can be invoked via `session.control` RPC.
  */
 import type { Writable } from "node:stream";
 import { OutboundRpc } from "./rpc.js";
 import { type SessionCreateParams, type SessionCreateResult } from "./protocol.js";
-export interface SessionEnvelope {
-    create(params: SessionCreateParams): Promise<SessionCreateResult>;
-    send(message: Record<string, unknown>): Promise<void>;
-    stream(streamId: string, out: Writable): Promise<void>;
-    cancelStream(streamId: string): void;
-    close(): Promise<void>;
-    resume(options?: Record<string, unknown>): Promise<void>;
-}
-type SdkSession = {
-    readonly sessionId: string;
-    send(message: string | Record<string, unknown>): Promise<void>;
-    stream(): AsyncGenerator<Record<string, unknown>, void>;
+type SdkUserMessage = {
+    type: "user";
+    message: {
+        role: "user";
+        content: string;
+    };
+    parent_tool_use_id: null;
+};
+type SdkMessage = Record<string, unknown>;
+type QueryHandle = AsyncGenerator<SdkMessage, void> & {
+    interrupt(): Promise<void>;
+    setPermissionMode(mode: string): Promise<void>;
+    setModel(model?: string): Promise<void>;
+    applyFlagSettings(settings: Record<string, unknown>): Promise<void>;
+    initializationResult(): Promise<unknown>;
+    supportedCommands(): Promise<unknown>;
+    supportedModels(): Promise<unknown>;
+    supportedAgents(): Promise<unknown>;
+    mcpServerStatus(): Promise<unknown>;
+    getContextUsage(): Promise<unknown>;
+    reloadPlugins(): Promise<unknown>;
+    accountInfo(): Promise<unknown>;
+    rewindFiles(userMessageId: string, options?: {
+        dryRun?: boolean;
+    }): Promise<unknown>;
+    seedReadState(path: string, mtime: number): Promise<void>;
+    reconnectMcpServer(serverName: string): Promise<void>;
+    toggleMcpServer(serverName: string, enabled: boolean): Promise<void>;
+    setMcpServers(servers: Record<string, unknown>): Promise<unknown>;
+    stopTask(taskId: string): Promise<void>;
     close(): void;
 };
 type SdkModule = {
-    unstable_v2_createSession: (opts: Record<string, unknown>) => SdkSession;
-    unstable_v2_resumeSession?: (sessionId: string, opts: Record<string, unknown>) => SdkSession;
+    query: (params: {
+        prompt: AsyncIterable<SdkUserMessage>;
+        options?: unknown;
+    }) => QueryHandle;
 };
-export declare class RealSession implements SessionEnvelope {
+export declare const CONTROL_METHODS: readonly ["interrupt", "setPermissionMode", "setModel", "applyFlagSettings", "initializationResult", "supportedCommands", "supportedModels", "supportedAgents", "mcpServerStatus", "getContextUsage", "reloadPlugins", "accountInfo", "rewindFiles", "seedReadState", "reconnectMcpServer", "toggleMcpServer", "setMcpServers", "stopTask"];
+export declare class QuerySession {
     private sdk;
-    private _rpc;
-    private handle;
+    private rpc;
+    private out;
+    private query;
+    private input;
     private sessionId;
-    private sdkSessionId;
     private createdAt;
-    private options;
     private closed;
-    private cancelled;
-    constructor(sdk: SdkModule, _rpc: OutboundRpc);
+    private pumpDone;
+    private turnSeq;
+    constructor(sdk: SdkModule, rpc: OutboundRpc, out: Writable);
     create(params: SessionCreateParams): Promise<SessionCreateResult>;
-    send(message: Record<string, unknown>): Promise<void>;
-    stream(streamId: string, out: Writable): Promise<void>;
-    cancelStream(streamId: string): void;
+    send(content: string, turnId: string | undefined): Promise<string>;
+    control(method: string, args: unknown[] | undefined): Promise<unknown>;
+    resume(sdkSessionId: string, options: Record<string, unknown>): Promise<void>;
     close(): Promise<void>;
-    resume(options?: Record<string, unknown>): Promise<void>;
-    private captureSdkSessionId;
+    private nextTurnId;
+    private pump;
+    /**
+     * Inject a canUseTool proxy that forwards decisions back to Elixir, if the
+     * caller opted in. We intentionally do not mutate the caller's hooks/options
+     * further — everything else is passed through as the SDK expects.
+     */
+    private enrichOptions;
 }
 export interface ModeInfo {
     sdkVersion: string;
 }
 export declare function buildSession(): Promise<{
-    make: (rpc: OutboundRpc) => SessionEnvelope;
+    make: (rpc: OutboundRpc, out: Writable) => QuerySession;
     info: ModeInfo;
 }>;
 export {};

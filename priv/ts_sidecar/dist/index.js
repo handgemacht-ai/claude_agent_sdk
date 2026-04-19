@@ -2,18 +2,16 @@
 /**
  * Sidecar main loop.
  *
- * One Node process, many logical sessions. Reads JSON-RPC frames from
- * stdin, dispatches requests by method, routes responses to the
- * outbound RPC client, writes notifications and responses to stdout.
- * Every session operation carries a `sessionId` — the Elixir side
- * owns that identifier; the sidecar stores session handles in
- * `sessions: Map<sessionId, SessionEnvelope>`.
+ * One Node process, many logical sessions. Each session wraps a single
+ * `query()` on the SDK. Control operations (getContextUsage,
+ * supportedAgents, setModel, interrupt, …) route through
+ * `session.control`.
  */
 import { readFrames, send } from "./framing.js";
 import { buildSession } from "./session.js";
 import { OutboundRpc } from "./rpc.js";
-import { ERROR_INTERNAL, ERROR_INVALID_PARAMS, ERROR_METHOD_NOT_FOUND, ERROR_SESSION_UNKNOWN, METHOD_PING, METHOD_SESSION_CLOSE, METHOD_SESSION_CREATE, METHOD_SESSION_RESUME, METHOD_SESSION_SEND, METHOD_SESSION_STREAM_CANCEL, METHOD_SESSION_STREAM_START, METHOD_SHUTDOWN, NOTIF_LOG, NOTIF_SIDECAR_READY, PROTOCOL_VERSION, } from "./protocol.js";
-const SIDECAR_VERSION = "0.1.0";
+import { ERROR_CONTROL_FAILED, ERROR_INTERNAL, ERROR_INVALID_PARAMS, ERROR_METHOD_NOT_FOUND, ERROR_SESSION_UNKNOWN, METHOD_PING, METHOD_SESSION_CLOSE, METHOD_SESSION_CONTROL, METHOD_SESSION_CREATE, METHOD_SESSION_RESUME, METHOD_SESSION_SEND, METHOD_SHUTDOWN, NOTIF_LOG, NOTIF_SIDECAR_READY, PROTOCOL_VERSION, } from "./protocol.js";
+const SIDECAR_VERSION = "0.2.0";
 async function main() {
     const { make, info } = await buildSession();
     const rpc = new OutboundRpc(process.stdout);
@@ -32,7 +30,7 @@ async function main() {
     let shuttingDown = false;
     for await (const frame of readFrames(process.stdin)) {
         const v = frame.value;
-        // Responses to our own outbound calls (hook.fire, mcp.call) are
+        // Responses to outbound RPCs (hook.fire, mcp.call, can_use_tool) are
         // absorbed here and never hit the dispatcher.
         if (rpc.feed(v))
             continue;
@@ -42,8 +40,6 @@ async function main() {
         const id = v.id;
         const method = v.method;
         const params = (v.params ?? {});
-        // Dispatch the request in a fresh microtask so long-running calls
-        // (e.g. session.create under a slow resume) don't block the reader.
         void handleRequest(id, method, params, { sessions, make, rpc, log }).then((shouldShutdown) => {
             if (shouldShutdown)
                 shuttingDown = true;
@@ -98,7 +94,7 @@ async function dispatch(method, params, ctx) {
                     sessionId: p.sessionId,
                 });
             }
-            const env = ctx.make(ctx.rpc);
+            const env = ctx.make(ctx.rpc, process.stdout);
             const result = await env.create(p);
             ctx.sessions.set(p.sessionId, env);
             ctx.log("info", "session created", { sessionId: p.sessionId });
@@ -107,26 +103,28 @@ async function dispatch(method, params, ctx) {
         case METHOD_SESSION_SEND: {
             const p = params;
             const env = lookup(ctx, p.sessionId);
-            await env.send(p.message);
-            return { accepted: true };
+            const turnId = await env.send(p.content, p.turnId);
+            return { turnId };
         }
-        case METHOD_SESSION_STREAM_START: {
+        case METHOD_SESSION_CONTROL: {
             const p = params;
             const env = lookup(ctx, p.sessionId);
-            env.stream(p.streamId, process.stdout).catch((err) => {
-                ctx.log("error", "stream failed", {
+            try {
+                const value = await env.control(p.method, p.args);
+                return { value };
+            }
+            catch (err) {
+                throw rpcError(ERROR_CONTROL_FAILED, err.message, {
                     sessionId: p.sessionId,
-                    streamId: p.streamId,
-                    error: err.message,
+                    method: p.method,
                 });
-            });
-            return { streamId: p.streamId };
+            }
         }
-        case METHOD_SESSION_STREAM_CANCEL: {
+        case METHOD_SESSION_RESUME: {
             const p = params;
             const env = lookup(ctx, p.sessionId);
-            env.cancelStream(p.streamId);
-            return { cancelled: true };
+            await env.resume(p.sdkSessionId, p.options ?? {});
+            return { sessionId: p.sessionId, resumedAt: new Date().toISOString() };
         }
         case METHOD_SESSION_CLOSE: {
             const p = params;
@@ -135,12 +133,6 @@ async function dispatch(method, params, ctx) {
             ctx.sessions.delete(p.sessionId);
             ctx.log("info", "session closed", { sessionId: p.sessionId });
             return { closed: true };
-        }
-        case METHOD_SESSION_RESUME: {
-            const p = params;
-            const env = lookup(ctx, p.sessionId);
-            await env.resume(p.options);
-            return { sessionId: p.sessionId, resumedAt: new Date().toISOString() };
         }
         default:
             throw rpcError(ERROR_METHOD_NOT_FOUND, `unknown method: ${method}`);

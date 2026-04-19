@@ -2,20 +2,14 @@ defmodule ClaudeAgentSDK.SidecarSession do
   @moduledoc """
   One logical session over the sidecar transport.
 
-  Wraps a single `unstable_v2_createSession` on the Node side. The
-  `sessionId` is generated on the Elixir side (UUID v4 string) and
-  passed into `session.create` so every downstream method — and every
-  inbound notification — carries a stable key for demultiplexing.
+  Wraps a single `query()` on the Node side. The `sessionId` is
+  generated on the Elixir side (UUID v4 string) and passed into
+  `session.create` so every subsequent RPC and every inbound
+  notification carries a stable key for demultiplexing.
 
-  State is intentionally light:
-    * `session_id` — opaque UUID
-    * `worker` — assigned `Sidecar.Worker` pid
-    * `subscribers` — pids receiving stream messages
-    * `status` — `:new | :created | :streaming | :closed`
-    * `stream_buffer` — accumulated `stream.message` payloads (for demo/context)
-
-  Not a replacement for `ClaudeAgentSDK.Streaming` yet — this is the
-  primitive the public API will be ported onto.
+  All SDK messages the model emits (system/init, assistant, result,
+  rate_limit_event, hook events, …) are forwarded as
+  `{:sdk_message, session_id, message}` to every subscriber.
   """
   use GenServer
   require Logger
@@ -33,18 +27,15 @@ defmodule ClaudeAgentSDK.SidecarSession do
       :options,
       :hook_handler,
       :mcp_handler,
+      :can_use_tool_handler,
       status: :new,
       subscribers: [],
-      stream_buffer: [],
-      stream_id: nil,
-      messages_sent: 0,
-      created_at: nil,
-      hook_fires: [],
-      mcp_calls: []
+      messages: [],
+      created_at: nil
     ]
   end
 
-  # --- Public API -----------------------------------------------------------
+  # --- Public API ------------------------------------------------------------
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
@@ -55,32 +46,64 @@ defmodule ClaudeAgentSDK.SidecarSession do
 
   Required opts:
     * `:worker` — `Sidecar.Worker` pid
-    * `:options` — map passed verbatim as TS-side session options
+    * `:options` — map passed verbatim as TS-side `query()` options
+      (Agent SDK `Options` shape: model, agents, hooks, mcpServers,
+      tools, etc.)
 
   Optional:
     * `:session_id` — override the generated UUID
-    * `:registry` — registry name (default `SessionRegistry.name/0`)
-    * `:hook_events` — list of hook event strings to register
-    * `:mcp_tools` — list of tool descriptors
-    * `:hook_handler` — `(event, payload) -> map` for responding to hook.fire
+    * `:registry` — registry name (default `SessionRegistry.name/0`;
+      pass `nil` to skip registration)
+    * `:permission_bridge` — when true, SDK `canUseTool` calls route
+      back to Elixir as `can_use_tool` RPC (requires
+      `:can_use_tool_handler`)
+    * `:hook_handler` — `(event, payload) -> map` for responding to
+      hook.fire callbacks
+    * `:mcp_handler` — `(server, tool, args) -> map` for responding to
+      mcp.call callbacks
+    * `:can_use_tool_handler` — `(tool_name, input) -> map` for the
+      permission bridge
   """
-  def create(session, timeout \\ 15_000) do
+  def create(session, timeout \\ 30_000) when is_integer(timeout) do
     GenServer.call(session, :create, timeout + 2_000)
   end
 
-  def send_message(session, text) when is_binary(text) do
-    GenServer.call(session, {:send, %{role: "user", content: text}})
+  @doc "Send a user message. Returns `{:ok, turn_id}`."
+  def send_message(session, content) when is_binary(content) do
+    GenServer.call(session, {:send, content})
   end
 
-  def start_stream(session, stream_id \\ nil) do
-    GenServer.call(session, {:stream_start, stream_id})
+  @doc """
+  Invoke a `Query` control method by name.
+
+  Supported methods (from the SDK's `Query` interface):
+  `interrupt`, `setPermissionMode`, `setModel`, `applyFlagSettings`,
+  `initializationResult`, `supportedCommands`, `supportedModels`,
+  `supportedAgents`, `mcpServerStatus`, `getContextUsage`,
+  `reloadPlugins`, `accountInfo`, `rewindFiles`, `seedReadState`,
+  `reconnectMcpServer`, `toggleMcpServer`, `setMcpServers`, `stopTask`.
+  """
+  def control(session, method, args \\ []) when is_binary(method) and is_list(args) do
+    GenServer.call(session, {:control, method, args}, 60_000)
   end
+
+  # Convenience wrappers for the most-used control methods.
+  def get_context_usage(session), do: control(session, "getContextUsage")
+  def supported_agents(session), do: control(session, "supportedAgents")
+  def supported_commands(session), do: control(session, "supportedCommands")
+  def supported_models(session), do: control(session, "supportedModels")
+  def initialization_result(session), do: control(session, "initializationResult")
+  def mcp_server_status(session), do: control(session, "mcpServerStatus")
+  def account_info(session), do: control(session, "accountInfo")
+  def interrupt(session), do: control(session, "interrupt")
+  def set_model(session, model), do: control(session, "setModel", [model])
+
+  def set_permission_mode(session, mode),
+    do: control(session, "setPermissionMode", [mode])
 
   def subscribe(session, pid \\ self()) do
     GenServer.call(session, {:subscribe, pid})
   end
-
-  def context(session), do: GenServer.call(session, :context)
 
   def close(session), do: GenServer.call(session, :close)
 
@@ -101,58 +124,50 @@ defmodule ClaudeAgentSDK.SidecarSession do
       registry: registry,
       options: options,
       hook_handler: Keyword.get(opts, :hook_handler),
-      mcp_handler: Keyword.get(opts, :mcp_handler)
+      mcp_handler: Keyword.get(opts, :mcp_handler),
+      can_use_tool_handler: Keyword.get(opts, :can_use_tool_handler)
     }
 
-    {:ok, state, {:continue, {:register, opts}}}
+    {:ok, state, {:continue, :register}}
   end
 
   @impl true
-  def handle_continue({:register, opts}, state) do
+  def handle_continue(:register, state) do
     try_register(state)
     :ok = Worker.register_session(state.worker, state.session_id, self())
-    {:noreply, %{state | options: Map.merge(state.options, params_overrides(opts))}}
+    {:noreply, state}
   end
 
   defp try_register(%{registry: nil}), do: :ok
 
   defp try_register(state) do
     if Process.whereis(state.registry) do
-      case Registry.register(state.registry, state.session_id, nil) do
-        {:ok, _} -> :ok
-        {:error, {:already_registered, _}} -> :ok
-      end
+      SessionRegistry.register(state.registry, state.session_id, self())
     else
       :ok
     end
   end
 
-  defp params_overrides(opts) do
-    %{}
-    |> maybe_put(:hook_events, Keyword.get(opts, :hook_events))
-    |> maybe_put(:mcp_tools, Keyword.get(opts, :mcp_tools))
-  end
-
-  defp maybe_put(m, _, nil), do: m
-  defp maybe_put(m, k, v), do: Map.put(m, k, v)
-
   @impl true
   def handle_call(:session_id, _from, state), do: {:reply, state.session_id, state}
 
+  def handle_call({:subscribe, pid}, _from, state) do
+    Process.monitor(pid)
+    {:reply, :ok, %{state | subscribers: [pid | state.subscribers]}}
+  end
+
   def handle_call(:create, _from, %{status: :new} = state) do
-    params =
-      %{
-        sessionId: state.session_id,
-        options: Map.get(state.options, :sdk_options, %{})
-      }
-      |> maybe_put(:hookEvents, Map.get(state.options, :hook_events))
-      |> maybe_put(:mcpTools, Map.get(state.options, :mcp_tools))
+    params = %{
+      sessionId: state.session_id,
+      options: state.options,
+      permissionBridge: not is_nil(state.can_use_tool_handler)
+    }
 
     case Worker.call_rpc(state.worker, Protocol.method_session_create(), params) do
-      {:ok, %{"sessionId" => sid, "createdAt" => created_at}} ->
-        {:reply, {:ok, sid}, %{state | status: :created, session_id: sid, created_at: created_at}}
+      {:ok, %{"sessionId" => sid, "createdAt" => at}} ->
+        {:reply, {:ok, sid}, %{state | status: :ready, session_id: sid, created_at: at}}
 
-      {:error, _} = err ->
+      err ->
         {:reply, err, state}
     end
   end
@@ -160,67 +175,35 @@ defmodule ClaudeAgentSDK.SidecarSession do
   def handle_call(:create, _from, state),
     do: {:reply, {:error, {:bad_status, state.status}}, state}
 
-  def handle_call({:send, message}, _from, %{status: s} = state)
-      when s in [:created, :streaming] do
-    params = %{sessionId: state.session_id, message: message}
+  def handle_call({:send, content}, _from, %{status: :ready} = state) do
+    params = %{sessionId: state.session_id, content: content}
 
     case Worker.call_rpc(state.worker, Protocol.method_session_send(), params) do
-      {:ok, _} ->
-        {:reply, :ok, %{state | messages_sent: state.messages_sent + 1}}
-
-      err ->
-        {:reply, err, state}
+      {:ok, %{"turnId" => turn_id}} -> {:reply, {:ok, turn_id}, state}
+      err -> {:reply, err, state}
     end
   end
 
   def handle_call({:send, _}, _from, state),
     do: {:reply, {:error, {:bad_status, state.status}}, state}
 
-  def handle_call({:stream_start, sid_opt}, _from, %{status: :created} = state) do
-    stream_id = sid_opt || generate_session_id()
-    params = %{sessionId: state.session_id, streamId: stream_id}
+  def handle_call({:control, method, args}, _from, %{status: :ready} = state) do
+    params = %{sessionId: state.session_id, method: method, args: args}
 
-    case Worker.call_rpc(state.worker, Protocol.method_session_stream_start(), params) do
-      {:ok, %{"streamId" => sid}} ->
-        {:reply, {:ok, sid}, %{state | status: :streaming, stream_id: sid}}
-
-      err ->
-        {:reply, err, state}
+    case Worker.call_rpc(state.worker, Protocol.method_session_control(), params, timeout: 60_000) do
+      {:ok, %{"value" => value}} -> {:reply, {:ok, value}, state}
+      err -> {:reply, err, state}
     end
   end
 
-  def handle_call({:stream_start, _}, _from, state),
+  def handle_call({:control, _, _}, _from, state),
     do: {:reply, {:error, {:bad_status, state.status}}, state}
 
-  def handle_call({:subscribe, pid}, _from, state) do
-    Process.monitor(pid)
-    {:reply, :ok, %{state | subscribers: [pid | state.subscribers]}}
-  end
-
-  def handle_call(:context, _from, state) do
-    ctx = %{
-      session_id: state.session_id,
-      status: state.status,
-      created_at: state.created_at,
-      messages_sent: state.messages_sent,
-      stream_messages_received: length(state.stream_buffer),
-      last_stream_messages: Enum.take(Enum.reverse(state.stream_buffer), 10),
-      hook_fires: Enum.reverse(state.hook_fires),
-      mcp_calls: Enum.reverse(state.mcp_calls)
-    }
-
-    {:reply, ctx, state}
-  end
-
-  def handle_call(:close, _from, %{status: :closed} = state),
-    do: {:reply, :ok, state}
+  def handle_call(:close, _from, %{status: :closed} = state), do: {:reply, :ok, state}
 
   def handle_call(:close, _from, state) do
     params = %{sessionId: state.session_id}
-
-    _ =
-      Worker.call_rpc(state.worker, Protocol.method_session_close(), params)
-
+    _ = Worker.call_rpc(state.worker, Protocol.method_session_close(), params)
     Worker.unregister_session(state.worker, state.session_id)
     {:reply, :ok, %{state | status: :closed}}
   end
@@ -245,21 +228,21 @@ defmodule ClaudeAgentSDK.SidecarSession do
 
   def handle_info(_, state), do: {:noreply, state}
 
-  # --- helpers --------------------------------------------------------------
+  # --- notification/inbound request routing ---------------------------------
 
-  defp handle_notification("stream.message", params, state) do
-    Enum.each(state.subscribers, &send(&1, {:stream_message, state.session_id, params}))
-    %{state | stream_buffer: [params | state.stream_buffer]}
-  end
-
-  defp handle_notification("stream.end", params, state) do
-    Enum.each(state.subscribers, &send(&1, {:stream_end, state.session_id, params}))
-    %{state | status: :created}
-  end
-
-  defp handle_notification("stream.error", params, state) do
-    Enum.each(state.subscribers, &send(&1, {:stream_error, state.session_id, params}))
+  defp handle_notification("session.message", %{"message" => message}, state) do
+    Enum.each(state.subscribers, &send(&1, {:sdk_message, state.session_id, message}))
     state
+  end
+
+  defp handle_notification("session.error", %{"error" => err}, state) do
+    Enum.each(state.subscribers, &send(&1, {:session_error, state.session_id, err}))
+    state
+  end
+
+  defp handle_notification("session.closed", %{"reason" => reason}, state) do
+    Enum.each(state.subscribers, &send(&1, {:session_closed, state.session_id, reason}))
+    %{state | status: :closed}
   end
 
   defp handle_notification(_method, _params, state), do: state
@@ -268,25 +251,18 @@ defmodule ClaudeAgentSDK.SidecarSession do
     event = params["event"]
     payload = params["payload"] || %{}
 
-    case state.hook_handler do
-      nil ->
-        Worker.respond(worker, id, %{decision: "continue"})
+    reply =
+      case state.hook_handler do
+        nil -> %{decision: "continue"}
+        h when is_function(h, 2) -> normalize_hook_result(h.(event, payload))
+      end
 
-      h when is_function(h, 2) ->
-        try do
-          Worker.respond(worker, id, normalize_hook_result(h.(event, payload)))
-        rescue
-          e ->
-            Worker.respond_error(
-              worker,
-              id,
-              -32004,
-              "hook handler raised: #{Exception.message(e)}"
-            )
-        end
-    end
-
-    %{state | hook_fires: [%{event: event, payload: payload} | state.hook_fires]}
+    Worker.respond(worker, id, reply)
+    state
+  rescue
+    e ->
+      Worker.respond_error(worker, id, -32_004, "hook handler raised: #{Exception.message(e)}")
+      state
   end
 
   defp handle_inbound_request(id, "mcp.call", params, worker, state) do
@@ -296,31 +272,49 @@ defmodule ClaudeAgentSDK.SidecarSession do
 
     case state.mcp_handler do
       nil ->
-        Worker.respond_error(worker, id, -32005, "no mcp_handler registered", %{
+        Worker.respond_error(worker, id, -32_005, "no mcp_handler registered", %{
           server: server,
           tool: tool
         })
 
       h when is_function(h, 3) ->
-        try do
-          result = h.(server, tool, args)
-          Worker.respond(worker, id, normalize_mcp_result(result))
-        rescue
-          e ->
-            Worker.respond_error(
-              worker,
-              id,
-              -32005,
-              "mcp handler raised: #{Exception.message(e)}"
-            )
-        end
+        Worker.respond(worker, id, normalize_mcp_result(h.(server, tool, args)))
     end
 
-    %{state | mcp_calls: [%{server: server, tool: tool, args: args} | state.mcp_calls]}
+    state
+  rescue
+    e ->
+      Worker.respond_error(worker, id, -32_005, "mcp handler raised: #{Exception.message(e)}")
+      state
+  end
+
+  defp handle_inbound_request(id, "can_use_tool", params, worker, state) do
+    tool_name = params["toolName"]
+    input = params["input"] || %{}
+
+    case state.can_use_tool_handler do
+      nil ->
+        Worker.respond(worker, id, %{behavior: "allow"})
+
+      h when is_function(h, 2) ->
+        Worker.respond(worker, id, normalize_permission_result(h.(tool_name, input)))
+    end
+
+    state
+  rescue
+    e ->
+      Worker.respond_error(
+        worker,
+        id,
+        -32_003,
+        "permission handler raised: #{Exception.message(e)}"
+      )
+
+      state
   end
 
   defp handle_inbound_request(id, method, _params, worker, state) do
-    Worker.respond_error(worker, id, -32601, "method not implemented in session: #{method}")
+    Worker.respond_error(worker, id, -32_601, "method not implemented in session: #{method}")
     state
   end
 
@@ -339,10 +333,19 @@ defmodule ClaudeAgentSDK.SidecarSession do
   defp normalize_mcp_result(other),
     do: %{content: [%{type: "text", text: inspect(other)}]}
 
+  defp normalize_permission_result(%{behavior: _} = m), do: m
+  defp normalize_permission_result(%{"behavior" => _} = m), do: m
+  defp normalize_permission_result(:allow), do: %{behavior: "allow"}
+
+  defp normalize_permission_result({:allow, input}) when is_map(input),
+    do: %{behavior: "allow", updatedInput: input}
+
+  defp normalize_permission_result({:deny, msg}), do: %{behavior: "deny", message: msg}
+  defp normalize_permission_result(_), do: %{behavior: "allow"}
+
   defp generate_session_id do
     <<a::32, b::16, c::16, d::16, e::48>> = :crypto.strong_rand_bytes(16)
 
-    # UUID v4
     c = Bitwise.band(c, 0x0FFF) |> Bitwise.bor(0x4000)
     d = Bitwise.band(d, 0x3FFF) |> Bitwise.bor(0x8000)
 

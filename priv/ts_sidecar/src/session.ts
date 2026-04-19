@@ -1,10 +1,14 @@
 /**
- * Per-session wrapper around the TS Agent SDK.
+ * Sidecar session built on the stable `query()` API.
  *
- * One `unstable_v2_createSession` handle per logical Elixir session. The
- * Elixir-generated `sessionId` is the demux key on the wire — it is NOT
- * passed to the SDK (the SDK generates its own). We retain the SDK's
- * sessionId in `sdkSessionId` in case a caller needs it (e.g. resume).
+ * Design:
+ *   • One `query()` per logical Elixir session. Streaming input enables
+ *     multi-turn conversations and unlocks the full `Query` control
+ *     surface (getContextUsage, supportedAgents, setModel, etc.).
+ *   • A pushable async iterable feeds user messages into the query.
+ *   • Every SDK message is forwarded verbatim as `session.message`.
+ *   • Control methods are routed through `CONTROL_METHODS` — any
+ *     method listed here can be invoked via `session.control` RPC.
  */
 
 import type { Writable } from "node:stream";
@@ -12,130 +16,261 @@ import { createRequire } from "node:module";
 import { send } from "./framing.js";
 import { OutboundRpc } from "./rpc.js";
 import {
-  NOTIF_STREAM_END,
-  NOTIF_STREAM_ERROR,
-  NOTIF_STREAM_MESSAGE,
+  NOTIF_SESSION_CLOSED,
+  NOTIF_SESSION_ERROR,
+  NOTIF_SESSION_MESSAGE,
+  METHOD_CAN_USE_TOOL,
+  type CanUseToolResult,
   type SessionCreateParams,
   type SessionCreateResult,
 } from "./protocol.js";
 
-export interface SessionEnvelope {
-  create(params: SessionCreateParams): Promise<SessionCreateResult>;
-  send(message: Record<string, unknown>): Promise<void>;
-  stream(streamId: string, out: Writable): Promise<void>;
-  cancelStream(streamId: string): void;
-  close(): Promise<void>;
-  resume(options?: Record<string, unknown>): Promise<void>;
-}
+type SdkUserMessage = {
+  type: "user";
+  message: { role: "user"; content: string };
+  parent_tool_use_id: null;
+};
 
-type SdkSession = {
-  readonly sessionId: string;
-  send(message: string | Record<string, unknown>): Promise<void>;
-  stream(): AsyncGenerator<Record<string, unknown>, void>;
+type SdkMessage = Record<string, unknown>;
+
+type QueryHandle = AsyncGenerator<SdkMessage, void> & {
+  interrupt(): Promise<void>;
+  setPermissionMode(mode: string): Promise<void>;
+  setModel(model?: string): Promise<void>;
+  applyFlagSettings(settings: Record<string, unknown>): Promise<void>;
+  initializationResult(): Promise<unknown>;
+  supportedCommands(): Promise<unknown>;
+  supportedModels(): Promise<unknown>;
+  supportedAgents(): Promise<unknown>;
+  mcpServerStatus(): Promise<unknown>;
+  getContextUsage(): Promise<unknown>;
+  reloadPlugins(): Promise<unknown>;
+  accountInfo(): Promise<unknown>;
+  rewindFiles(userMessageId: string, options?: { dryRun?: boolean }): Promise<unknown>;
+  seedReadState(path: string, mtime: number): Promise<void>;
+  reconnectMcpServer(serverName: string): Promise<void>;
+  toggleMcpServer(serverName: string, enabled: boolean): Promise<void>;
+  setMcpServers(servers: Record<string, unknown>): Promise<unknown>;
+  stopTask(taskId: string): Promise<void>;
   close(): void;
 };
 
 type SdkModule = {
-  unstable_v2_createSession: (opts: Record<string, unknown>) => SdkSession;
-  unstable_v2_resumeSession?: (sessionId: string, opts: Record<string, unknown>) => SdkSession;
+  query: (params: { prompt: AsyncIterable<SdkUserMessage>; options?: unknown }) => QueryHandle;
 };
 
-export class RealSession implements SessionEnvelope {
-  private handle!: SdkSession;
+export const CONTROL_METHODS = [
+  "interrupt",
+  "setPermissionMode",
+  "setModel",
+  "applyFlagSettings",
+  "initializationResult",
+  "supportedCommands",
+  "supportedModels",
+  "supportedAgents",
+  "mcpServerStatus",
+  "getContextUsage",
+  "reloadPlugins",
+  "accountInfo",
+  "rewindFiles",
+  "seedReadState",
+  "reconnectMcpServer",
+  "toggleMcpServer",
+  "setMcpServers",
+  "stopTask",
+] as const;
+
+type ControlMethod = (typeof CONTROL_METHODS)[number];
+
+function isControlMethod(name: string): name is ControlMethod {
+  return (CONTROL_METHODS as readonly string[]).includes(name);
+}
+
+interface InputChannel {
+  iterable: AsyncIterable<SdkUserMessage>;
+  push(msg: SdkUserMessage): void;
+  close(): void;
+}
+
+function makeInputChannel(): InputChannel {
+  const queue: SdkUserMessage[] = [];
+  const resolvers: Array<(r: IteratorResult<SdkUserMessage, void>) => void> = [];
+  let closed = false;
+
+  const iterable: AsyncIterable<SdkUserMessage> = {
+    [Symbol.asyncIterator]() {
+      return {
+        next(): Promise<IteratorResult<SdkUserMessage, void>> {
+          if (queue.length > 0) {
+            return Promise.resolve({ value: queue.shift()!, done: false });
+          }
+          if (closed) return Promise.resolve({ value: undefined, done: true });
+          return new Promise((resolve) => resolvers.push(resolve));
+        },
+        return(): Promise<IteratorResult<SdkUserMessage, void>> {
+          closed = true;
+          while (resolvers.length) resolvers.shift()!({ value: undefined, done: true });
+          return Promise.resolve({ value: undefined, done: true });
+        },
+      };
+    },
+  };
+
+  return {
+    iterable,
+    push(msg) {
+      if (closed) throw new Error("input channel closed");
+      const r = resolvers.shift();
+      if (r) r({ value: msg, done: false });
+      else queue.push(msg);
+    },
+    close() {
+      closed = true;
+      while (resolvers.length) resolvers.shift()!({ value: undefined, done: true });
+    },
+  };
+}
+
+export class QuerySession {
+  private query!: QueryHandle;
+  private input!: InputChannel;
   private sessionId!: string;
-  private sdkSessionId: string | null = null;
   private createdAt!: string;
-  private options: Record<string, unknown> = {};
   private closed = false;
-  private cancelled = new Set<string>();
+  private pumpDone!: Promise<void>;
+  private turnSeq = 0;
 
   constructor(
     private sdk: SdkModule,
-    private _rpc: OutboundRpc,
+    private rpc: OutboundRpc,
+    private out: Writable,
   ) {}
 
   async create(params: SessionCreateParams): Promise<SessionCreateResult> {
     this.sessionId = params.sessionId;
-    this.options = params.options ?? {};
-    this.handle = this.sdk.unstable_v2_createSession(this.options);
+    this.input = makeInputChannel();
+
+    const options = this.enrichOptions(params.options, params.permissionBridge ?? false);
+    this.query = this.sdk.query({ prompt: this.input.iterable, options });
     this.createdAt = new Date().toISOString();
-    return { sessionId: params.sessionId, createdAt: this.createdAt };
+    this.pumpDone = this.pump();
+    return { sessionId: this.sessionId, createdAt: this.createdAt };
   }
 
-  async send(message: Record<string, unknown>): Promise<void> {
+  async send(content: string, turnId: string | undefined): Promise<string> {
     if (this.closed) throw new Error("session closed");
-    const text =
-      typeof message.content === "string"
-        ? (message.content as string)
-        : JSON.stringify(message);
-    await this.handle.send(text);
+    const assigned = turnId ?? this.nextTurnId();
+    this.input.push({
+      type: "user",
+      message: { role: "user", content },
+      parent_tool_use_id: null,
+    });
+    return assigned;
   }
 
-  async stream(streamId: string, out: Writable): Promise<void> {
+  async control(method: string, args: unknown[] | undefined): Promise<unknown> {
     if (this.closed) throw new Error("session closed");
-    try {
-      for await (const msg of this.handle.stream()) {
-        if (this.cancelled.has(streamId)) break;
-        this.captureSdkSessionId(msg);
-        send(out, {
-          jsonrpc: "2.0",
-          method: NOTIF_STREAM_MESSAGE,
-          params: { sessionId: this.sessionId, streamId, message: msg },
-        });
-      }
-      send(out, {
-        jsonrpc: "2.0",
-        method: NOTIF_STREAM_END,
-        params: {
-          sessionId: this.sessionId,
-          streamId,
-          reason: this.cancelled.has(streamId) ? "cancelled" : "message_stop",
-        },
-      });
-    } catch (err) {
-      send(out, {
-        jsonrpc: "2.0",
-        method: NOTIF_STREAM_ERROR,
-        params: {
-          sessionId: this.sessionId,
-          streamId,
-          error: { code: -32003, message: (err as Error).message },
-        },
-      });
+    if (!isControlMethod(method)) {
+      throw new Error(`unknown control method: ${method}`);
     }
+    const handle = this.query as unknown as Record<string, (...a: unknown[]) => unknown>;
+    const fn = handle[method];
+    if (typeof fn !== "function") {
+      throw new Error(`Query does not expose ${method}`);
+    }
+    return await fn.apply(this.query, args ?? []);
   }
 
-  cancelStream(streamId: string): void {
-    this.cancelled.add(streamId);
+  async resume(sdkSessionId: string, options: Record<string, unknown>): Promise<void> {
+    this.input.close();
+    try {
+      this.query.close();
+    } catch {
+      /* fine */
+    }
+    this.input = makeInputChannel();
+    const merged = { ...options, resume: sdkSessionId };
+    const enriched = this.enrichOptions(merged, false);
+    this.query = this.sdk.query({ prompt: this.input.iterable, options: enriched });
+    this.closed = false;
+    this.pumpDone = this.pump();
   }
 
   async close(): Promise<void> {
-    if (!this.closed) {
-      try {
-        this.handle.close();
-      } catch {
-        /* closing a dead handle is fine */
+    if (this.closed) return;
+    this.closed = true;
+    this.input.close();
+    try {
+      this.query.close();
+    } catch {
+      /* fine */
+    }
+    try {
+      await this.pumpDone;
+    } catch {
+      /* pump resolves on close */
+    }
+  }
+
+  private nextTurnId(): string {
+    this.turnSeq += 1;
+    return `turn-${this.turnSeq}`;
+  }
+
+  private async pump(): Promise<void> {
+    try {
+      for await (const msg of this.query) {
+        if (this.closed) break;
+        send(this.out, {
+          jsonrpc: "2.0",
+          method: NOTIF_SESSION_MESSAGE,
+          params: { sessionId: this.sessionId, message: msg },
+        });
       }
-      this.closed = true;
+      if (!this.closed) {
+        send(this.out, {
+          jsonrpc: "2.0",
+          method: NOTIF_SESSION_CLOSED,
+          params: { sessionId: this.sessionId, reason: "iterator_done" },
+        });
+        this.closed = true;
+      }
+    } catch (err) {
+      send(this.out, {
+        jsonrpc: "2.0",
+        method: NOTIF_SESSION_ERROR,
+        params: {
+          sessionId: this.sessionId,
+          error: { code: -32010, message: (err as Error).message },
+        },
+      });
     }
   }
 
-  async resume(options: Record<string, unknown> = {}): Promise<void> {
-    if (!this.sdk.unstable_v2_resumeSession) {
-      throw new Error("installed SDK has no unstable_v2_resumeSession");
-    }
-    const resumeId = this.sdkSessionId;
-    if (!resumeId) {
-      throw new Error("no upstream sessionId captured yet — stream at least one message first");
-    }
-    this.handle = this.sdk.unstable_v2_resumeSession(resumeId, { ...this.options, ...options });
-    this.closed = false;
-  }
+  /**
+   * Inject a canUseTool proxy that forwards decisions back to Elixir, if the
+   * caller opted in. We intentionally do not mutate the caller's hooks/options
+   * further — everything else is passed through as the SDK expects.
+   */
+  private enrichOptions(
+    options: Record<string, unknown>,
+    permissionBridge: boolean,
+  ): Record<string, unknown> {
+    if (!permissionBridge) return options;
 
-  private captureSdkSessionId(msg: Record<string, unknown>): void {
-    if (this.sdkSessionId) return;
-    const id = msg.session_id;
-    if (typeof id === "string") this.sdkSessionId = id;
+    const canUseTool = async (
+      toolName: string,
+      input: Record<string, unknown>,
+    ): Promise<CanUseToolResult> => {
+      const res = await this.rpc.call<CanUseToolResult>(METHOD_CAN_USE_TOOL, {
+        sessionId: this.sessionId,
+        toolName,
+        input,
+      });
+      return res;
+    };
+
+    return { ...options, canUseTool };
   }
 }
 
@@ -144,19 +279,16 @@ export interface ModeInfo {
 }
 
 export async function buildSession(): Promise<{
-  make: (rpc: OutboundRpc) => SessionEnvelope;
+  make: (rpc: OutboundRpc, out: Writable) => QuerySession;
   info: ModeInfo;
 }> {
   const mod = (await import("@anthropic-ai/claude-agent-sdk")) as unknown as SdkModule;
-  if (typeof mod.unstable_v2_createSession !== "function") {
-    throw new Error(
-      "installed @anthropic-ai/claude-agent-sdk does not expose unstable_v2_createSession",
-    );
+  if (typeof mod.query !== "function") {
+    throw new Error("installed @anthropic-ai/claude-agent-sdk does not export query()");
   }
-  const version = readSdkVersion();
   return {
-    make: (rpc) => new RealSession(mod, rpc),
-    info: { sdkVersion: version },
+    make: (rpc, out) => new QuerySession(mod, rpc, out),
+    info: { sdkVersion: readSdkVersion() },
   };
 }
 
