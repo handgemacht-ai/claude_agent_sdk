@@ -26,11 +26,9 @@ async function main() {
             sidecarVersion: SIDECAR_VERSION,
             sdkVersion: info.sdkVersion,
             nodeVersion: process.versions.node,
-            mode: info.mode,
-            modeReason: info.reason ?? null,
         },
     });
-    log("info", `sidecar ready (${info.mode})${info.reason ? ` — ${info.reason}` : ""}`);
+    log("info", `sidecar ready (sdk ${info.sdkVersion})`);
     let shuttingDown = false;
     for await (const frame of readFrames(process.stdin)) {
         const v = frame.value;

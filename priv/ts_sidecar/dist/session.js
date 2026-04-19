@@ -1,244 +1,64 @@
 /**
  * Per-session wrapper around the TS Agent SDK.
  *
- * Two execution paths:
- *
- *   • **real mode** — uses `@anthropic-ai/claude-agent-sdk`'s V2
- *     preview (`unstable_v2_createSession`). Requires auth + network.
- *   • **mock mode** — deterministic echo session. No network, no SDK
- *     import. Used for CI and validation without auth. Activated via
- *     `SIDECAR_MOCK=1` or automatic fallback when the SDK import
- *     throws at startup.
- *
- * Both paths expose the same in-process surface (`create`, `send`,
- * `stream`, `close`, `resume`) so `index.ts` doesn't branch on mode
- * after startup.
- *
- * Bridges:
- *   • **hook bridge** — when the Elixir side declares `hookEvents`,
- *     the sidecar fires `hook.fire` RPCs back to Elixir at the
- *     appropriate lifecycle points and applies the `decision` to the
- *     stream (for mock mode this is demonstration; real-mode hooks
- *     wire into the SDK's own callback surface).
- *   • **MCP bridge** — when `mcpTools` are declared, mock mode invokes
- *     the first tool once per stream to exercise the `mcp.call`
- *     round-trip; real mode registers a `createSdkMcpServer` whose
- *     handlers each proxy back to Elixir via `mcp.call`.
+ * One `unstable_v2_createSession` handle per logical Elixir session. The
+ * Elixir-generated `sessionId` is the demux key on the wire — it is NOT
+ * passed to the SDK (the SDK generates its own). We retain the SDK's
+ * sessionId in `sdkSessionId` in case a caller needs it (e.g. resume).
  */
+import { createRequire } from "node:module";
 import { send } from "./framing.js";
-import { NOTIF_STREAM_END, NOTIF_STREAM_ERROR, NOTIF_STREAM_MESSAGE, METHOD_HOOK_FIRE, METHOD_MCP_CALL, } from "./protocol.js";
-// ---------------------------------------------------------------------------
-// Mock session — deterministic echo, no network
-// ---------------------------------------------------------------------------
-export class MockSession {
-    rpc;
-    ctx;
-    createdAt;
-    lastUserText = "";
-    cancelled = new Set();
-    closed = false;
-    constructor(rpc) {
-        this.rpc = rpc;
-    }
-    async create(params) {
-        this.ctx = {
-            sessionId: params.sessionId,
-            hookEvents: params.hookEvents ?? [],
-            mcpTools: params.mcpTools ?? [],
-            options: params.options ?? {},
-        };
-        this.createdAt = new Date().toISOString();
-        return { sessionId: params.sessionId, createdAt: this.createdAt };
-    }
-    async send(message) {
-        if (this.closed)
-            throw new Error("session closed");
-        const content = typeof message.content === "string" ? message.content : "";
-        this.lastUserText = content;
-    }
-    async stream(streamId, out) {
-        if (this.closed)
-            throw new Error("session closed");
-        // --- Pre-stream hook (if registered) --------------------------------
-        let hookDecision = null;
-        if (this.ctx.hookEvents.includes("pre_tool_use")) {
-            try {
-                hookDecision = await this.rpc.call(METHOD_HOOK_FIRE, {
-                    sessionId: this.ctx.sessionId,
-                    event: "pre_tool_use",
-                    payload: { tool_name: "mock.echo", tool_input: { text: this.lastUserText } },
-                });
-            }
-            catch (err) {
-                this.emitStreamError(out, streamId, `hook.fire pre_tool_use failed: ${err.message}`);
-            }
-        }
-        if (hookDecision?.decision === "deny" || hookDecision?.decision === "block") {
-            send(out, {
-                jsonrpc: "2.0",
-                method: NOTIF_STREAM_MESSAGE,
-                params: {
-                    sessionId: this.ctx.sessionId,
-                    streamId,
-                    message: {
-                        type: "text_delta",
-                        text: `[blocked by hook: ${hookDecision.reason ?? "no reason"}]`,
-                    },
-                },
-            });
-            this.emitStreamEnd(out, streamId, "hook_denied");
-            return;
-        }
-        // --- MCP tool invocation (if any registered) ------------------------
-        let toolPrefix = "";
-        if (this.ctx.mcpTools.length > 0) {
-            const first = this.ctx.mcpTools[0];
-            try {
-                const result = await this.rpc.call(METHOD_MCP_CALL, {
-                    sessionId: this.ctx.sessionId,
-                    server: first.server,
-                    tool: first.tool,
-                    args: { probe: this.lastUserText.slice(0, 16) },
-                });
-                const firstContent = result.content?.[0];
-                const text = typeof firstContent?.text === "string"
-                    ? firstContent.text
-                    : JSON.stringify(result);
-                toolPrefix = `[tool:${first.server}/${first.tool} → ${text}] `;
-            }
-            catch (err) {
-                toolPrefix = `[tool:${first.server}/${first.tool} error: ${err.message}] `;
-            }
-        }
-        const reply = `${toolPrefix}echo (mock): ${this.lastUserText}`;
-        const chunks = chunkString(reply, 16);
-        for (const chunk of chunks) {
-            if (this.cancelled.has(streamId))
-                break;
-            send(out, {
-                jsonrpc: "2.0",
-                method: NOTIF_STREAM_MESSAGE,
-                params: {
-                    sessionId: this.ctx.sessionId,
-                    streamId,
-                    message: { type: "text_delta", text: chunk },
-                },
-            });
-            await sleep(5);
-        }
-        // --- Post-stream hook (if registered) -------------------------------
-        if (this.ctx.hookEvents.includes("task_completed")) {
-            try {
-                await this.rpc.call(METHOD_HOOK_FIRE, {
-                    sessionId: this.ctx.sessionId,
-                    event: "task_completed",
-                    payload: { reply_length: reply.length, cancelled: this.cancelled.has(streamId) },
-                });
-            }
-            catch (err) {
-                this.emitStreamError(out, streamId, `hook.fire task_completed failed: ${err.message}`);
-            }
-        }
-        this.emitStreamEnd(out, streamId, this.cancelled.has(streamId) ? "cancelled" : "message_stop");
-    }
-    cancelStream(streamId) {
-        this.cancelled.add(streamId);
-    }
-    async close() {
-        this.closed = true;
-    }
-    async resume(_options) {
-        this.closed = false;
-    }
-    emitStreamEnd(out, streamId, reason) {
-        send(out, {
-            jsonrpc: "2.0",
-            method: NOTIF_STREAM_END,
-            params: { sessionId: this.ctx.sessionId, streamId, reason },
-        });
-    }
-    emitStreamError(out, streamId, message) {
-        send(out, {
-            jsonrpc: "2.0",
-            method: NOTIF_STREAM_ERROR,
-            params: {
-                sessionId: this.ctx.sessionId,
-                streamId,
-                error: { code: -32004, message },
-            },
-        });
-    }
-}
+import { NOTIF_STREAM_END, NOTIF_STREAM_ERROR, NOTIF_STREAM_MESSAGE, } from "./protocol.js";
 export class RealSession {
     sdk;
-    rpc;
+    _rpc;
     handle;
-    ctx;
+    sessionId;
+    sdkSessionId = null;
     createdAt;
+    options = {};
     closed = false;
-    activeStreams = new Map();
-    constructor(sdk, rpc) {
+    cancelled = new Set();
+    constructor(sdk, _rpc) {
         this.sdk = sdk;
-        this.rpc = rpc;
+        this._rpc = _rpc;
     }
     async create(params) {
-        if (!this.sdk.unstable_v2_createSession) {
-            throw new Error("installed @anthropic-ai/claude-agent-sdk does not expose unstable_v2_createSession");
-        }
-        this.ctx = {
-            sessionId: params.sessionId,
-            hookEvents: params.hookEvents ?? [],
-            mcpTools: params.mcpTools ?? [],
-            options: params.options ?? {},
-        };
-        // MCP bridge: stubbed in real mode — real wiring happens when a
-        // production caller lands a concrete tool schema. The TS-side
-        // `createSdkMcpServer` wrapping is a follow-up once we validate
-        // the `unstable_v2_createSession` handle shape in production.
-        this.handle = await this.sdk.unstable_v2_createSession({
-            ...params.options,
-            sessionId: params.sessionId,
-        });
+        this.sessionId = params.sessionId;
+        this.options = params.options ?? {};
+        this.handle = this.sdk.unstable_v2_createSession(this.options);
         this.createdAt = new Date().toISOString();
         return { sessionId: params.sessionId, createdAt: this.createdAt };
     }
     async send(message) {
         if (this.closed)
             throw new Error("session closed");
-        if (typeof this.handle?.send !== "function") {
-            throw new Error("session handle has no send()");
-        }
-        await this.handle.send(message);
+        const text = typeof message.content === "string"
+            ? message.content
+            : JSON.stringify(message);
+        await this.handle.send(text);
     }
     async stream(streamId, out) {
         if (this.closed)
             throw new Error("session closed");
-        if (typeof this.handle?.stream !== "function") {
-            throw new Error("session handle has no stream()");
-        }
-        const controller = new AbortController();
-        this.activeStreams.set(streamId, controller);
         try {
-            for await (const msg of this.handle.stream({ signal: controller.signal })) {
-                if (controller.signal.aborted)
+            for await (const msg of this.handle.stream()) {
+                if (this.cancelled.has(streamId))
                     break;
+                this.captureSdkSessionId(msg);
                 send(out, {
                     jsonrpc: "2.0",
                     method: NOTIF_STREAM_MESSAGE,
-                    params: {
-                        sessionId: this.ctx.sessionId,
-                        streamId,
-                        message: msg,
-                    },
+                    params: { sessionId: this.sessionId, streamId, message: msg },
                 });
             }
             send(out, {
                 jsonrpc: "2.0",
                 method: NOTIF_STREAM_END,
                 params: {
-                    sessionId: this.ctx.sessionId,
+                    sessionId: this.sessionId,
                     streamId,
-                    reason: controller.signal.aborted ? "cancelled" : "message_stop",
+                    reason: this.cancelled.has(streamId) ? "cancelled" : "message_stop",
                 },
             });
         }
@@ -247,68 +67,59 @@ export class RealSession {
                 jsonrpc: "2.0",
                 method: NOTIF_STREAM_ERROR,
                 params: {
-                    sessionId: this.ctx.sessionId,
+                    sessionId: this.sessionId,
                     streamId,
                     error: { code: -32003, message: err.message },
                 },
             });
         }
-        finally {
-            this.activeStreams.delete(streamId);
-        }
     }
     cancelStream(streamId) {
-        this.activeStreams.get(streamId)?.abort();
+        this.cancelled.add(streamId);
     }
     async close() {
-        if (typeof this.handle?.close === "function") {
+        if (!this.closed) {
             try {
-                await this.handle.close();
+                this.handle.close();
             }
             catch {
-                /* swallow — closing a dead handle is fine */
+                /* closing a dead handle is fine */
             }
+            this.closed = true;
         }
-        this.closed = true;
     }
-    async resume(options) {
+    async resume(options = {}) {
         if (!this.sdk.unstable_v2_resumeSession) {
             throw new Error("installed SDK has no unstable_v2_resumeSession");
         }
-        this.handle = await this.sdk.unstable_v2_resumeSession(this.ctx.sessionId, options);
+        const resumeId = this.sdkSessionId;
+        if (!resumeId) {
+            throw new Error("no upstream sessionId captured yet — stream at least one message first");
+        }
+        this.handle = this.sdk.unstable_v2_resumeSession(resumeId, { ...this.options, ...options });
         this.closed = false;
+    }
+    captureSdkSessionId(msg) {
+        if (this.sdkSessionId)
+            return;
+        const id = msg.session_id;
+        if (typeof id === "string")
+            this.sdkSessionId = id;
     }
 }
 export async function buildSession() {
-    const forcedMock = process.env.SIDECAR_MOCK === "1";
-    if (forcedMock) {
-        return {
-            make: (rpc) => new MockSession(rpc),
-            info: { mode: "mock", sdkVersion: "mock-0.1.0", reason: "SIDECAR_MOCK=1" },
-        };
+    const mod = (await import("@anthropic-ai/claude-agent-sdk"));
+    if (typeof mod.unstable_v2_createSession !== "function") {
+        throw new Error("installed @anthropic-ai/claude-agent-sdk does not expose unstable_v2_createSession");
     }
-    try {
-        const mod = (await import("@anthropic-ai/claude-agent-sdk"));
-        const version = await readSdkVersion();
-        return {
-            make: (rpc) => new RealSession(mod, rpc),
-            info: { mode: "real", sdkVersion: version },
-        };
-    }
-    catch (err) {
-        return {
-            make: (rpc) => new MockSession(rpc),
-            info: {
-                mode: "mock",
-                sdkVersion: "mock-0.1.0",
-                reason: `SDK import failed: ${err.message}`,
-            },
-        };
-    }
+    const version = readSdkVersion();
+    return {
+        make: (rpc) => new RealSession(mod, rpc),
+        info: { sdkVersion: version },
+    };
 }
-async function readSdkVersion() {
+function readSdkVersion() {
     try {
-        const { createRequire } = await import("node:module");
         const require = createRequire(import.meta.url);
         const pkg = require("@anthropic-ai/claude-agent-sdk/package.json");
         return pkg.version ?? "unknown";
@@ -316,16 +127,5 @@ async function readSdkVersion() {
     catch {
         return "unknown";
     }
-}
-function chunkString(s, n) {
-    if (n <= 0)
-        return [s];
-    const out = [];
-    for (let i = 0; i < s.length; i += n)
-        out.push(s.slice(i, i + n));
-    return out.length ? out : [""];
-}
-function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
 }
 //# sourceMappingURL=session.js.map

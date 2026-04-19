@@ -52,12 +52,10 @@ async function main(): Promise<void> {
       sidecarVersion: SIDECAR_VERSION,
       sdkVersion: info.sdkVersion,
       nodeVersion: process.versions.node,
-      mode: info.mode,
-      modeReason: info.reason ?? null,
     },
   });
 
-  log("info", `sidecar ready (${info.mode})${info.reason ? ` — ${info.reason}` : ""}`);
+  log("info", `sidecar ready (sdk ${info.sdkVersion})`);
 
   let shuttingDown = false;
 

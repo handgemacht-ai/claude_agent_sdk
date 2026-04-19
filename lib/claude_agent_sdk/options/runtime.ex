@@ -20,8 +20,7 @@ defmodule ClaudeAgentSDK.Options.Runtime do
     spawn_timeout_ms: 10_000,
     shutdown_timeout_ms: 5_000,
     pool_size: 1,
-    resume_on_sidecar_restart: false,
-    mock: false
+    resume_on_sidecar_restart: false
   ]
 
   @type t :: %__MODULE__{
@@ -32,8 +31,7 @@ defmodule ClaudeAgentSDK.Options.Runtime do
           spawn_timeout_ms: non_neg_integer(),
           shutdown_timeout_ms: non_neg_integer(),
           pool_size: pos_integer(),
-          resume_on_sidecar_restart: boolean(),
-          mock: boolean()
+          resume_on_sidecar_restart: boolean()
         }
 
   @doc """
