@@ -32,12 +32,15 @@ defmodule ClaudeAgentSDK.SidecarSession do
       :registry,
       :options,
       :hook_handler,
+      :mcp_handler,
       status: :new,
       subscribers: [],
       stream_buffer: [],
       stream_id: nil,
       messages_sent: 0,
-      created_at: nil
+      created_at: nil,
+      hook_fires: [],
+      mcp_calls: []
     ]
   end
 
@@ -97,7 +100,8 @@ defmodule ClaudeAgentSDK.SidecarSession do
       worker: worker,
       registry: registry,
       options: options,
-      hook_handler: Keyword.get(opts, :hook_handler)
+      hook_handler: Keyword.get(opts, :hook_handler),
+      mcp_handler: Keyword.get(opts, :mcp_handler)
     }
 
     {:ok, state, {:continue, {:register, opts}}}
@@ -110,10 +114,16 @@ defmodule ClaudeAgentSDK.SidecarSession do
     {:noreply, %{state | options: Map.merge(state.options, params_overrides(opts))}}
   end
 
+  defp try_register(%{registry: nil}), do: :ok
+
   defp try_register(state) do
-    case Registry.register(state.registry, state.session_id, nil) do
-      {:ok, _} -> :ok
-      {:error, {:already_registered, _}} -> :ok
+    if Process.whereis(state.registry) do
+      case Registry.register(state.registry, state.session_id, nil) do
+        {:ok, _} -> :ok
+        {:error, {:already_registered, _}} -> :ok
+      end
+    else
+      :ok
     end
   end
 
@@ -194,7 +204,9 @@ defmodule ClaudeAgentSDK.SidecarSession do
       created_at: state.created_at,
       messages_sent: state.messages_sent,
       stream_messages_received: length(state.stream_buffer),
-      last_stream_messages: Enum.take(Enum.reverse(state.stream_buffer), 10)
+      last_stream_messages: Enum.take(Enum.reverse(state.stream_buffer), 10),
+      hook_fires: Enum.reverse(state.hook_fires),
+      mcp_calls: Enum.reverse(state.mcp_calls)
     }
 
     {:reply, ctx, state}
@@ -219,8 +231,7 @@ defmodule ClaudeAgentSDK.SidecarSession do
   end
 
   def handle_info({:sidecar_request, id, method, params, worker}, state) do
-    handle_inbound_request(id, method, params, worker, state)
-    {:noreply, state}
+    {:noreply, handle_inbound_request(id, method, params, worker, state)}
   end
 
   def handle_info({:sidecar_down, reason}, state) do
@@ -253,28 +264,64 @@ defmodule ClaudeAgentSDK.SidecarSession do
 
   defp handle_notification(_method, _params, state), do: state
 
-  defp handle_inbound_request(id, "hook.fire", params, worker, %{hook_handler: nil}) do
-    Worker.respond(worker, id, %{decision: "continue"})
-    :ok
-  end
+  defp handle_inbound_request(id, "hook.fire", params, worker, state) do
+    event = params["event"]
+    payload = params["payload"] || %{}
 
-  defp handle_inbound_request(id, "hook.fire", params, worker, %{hook_handler: h}) do
-    result =
-      try do
-        h.(params["event"], params["payload"] || %{})
-      rescue
-        e ->
-          Worker.respond_error(worker, id, -32004, "hook handler raised: #{Exception.message(e)}")
-          :handled
-      end
+    case state.hook_handler do
+      nil ->
+        Worker.respond(worker, id, %{decision: "continue"})
 
-    unless result == :handled do
-      Worker.respond(worker, id, normalize_hook_result(result))
+      h when is_function(h, 2) ->
+        try do
+          Worker.respond(worker, id, normalize_hook_result(h.(event, payload)))
+        rescue
+          e ->
+            Worker.respond_error(
+              worker,
+              id,
+              -32004,
+              "hook handler raised: #{Exception.message(e)}"
+            )
+        end
     end
+
+    %{state | hook_fires: [%{event: event, payload: payload} | state.hook_fires]}
   end
 
-  defp handle_inbound_request(id, method, _params, worker, _state) do
+  defp handle_inbound_request(id, "mcp.call", params, worker, state) do
+    server = params["server"]
+    tool = params["tool"]
+    args = params["args"] || %{}
+
+    case state.mcp_handler do
+      nil ->
+        Worker.respond_error(worker, id, -32005, "no mcp_handler registered", %{
+          server: server,
+          tool: tool
+        })
+
+      h when is_function(h, 3) ->
+        try do
+          result = h.(server, tool, args)
+          Worker.respond(worker, id, normalize_mcp_result(result))
+        rescue
+          e ->
+            Worker.respond_error(
+              worker,
+              id,
+              -32005,
+              "mcp handler raised: #{Exception.message(e)}"
+            )
+        end
+    end
+
+    %{state | mcp_calls: [%{server: server, tool: tool, args: args} | state.mcp_calls]}
+  end
+
+  defp handle_inbound_request(id, method, _params, worker, state) do
     Worker.respond_error(worker, id, -32601, "method not implemented in session: #{method}")
+    state
   end
 
   defp normalize_hook_result(r) when is_map(r), do: r
@@ -282,6 +329,15 @@ defmodule ClaudeAgentSDK.SidecarSession do
   defp normalize_hook_result(:allow), do: %{decision: "allow"}
   defp normalize_hook_result({:deny, reason}), do: %{decision: "deny", reason: reason}
   defp normalize_hook_result(_), do: %{decision: "continue"}
+
+  defp normalize_mcp_result(%{content: _} = m), do: m
+  defp normalize_mcp_result(%{"content" => _} = m), do: m
+
+  defp normalize_mcp_result(text) when is_binary(text),
+    do: %{content: [%{type: "text", text: text}]}
+
+  defp normalize_mcp_result(other),
+    do: %{content: [%{type: "text", text: inspect(other)}]}
 
   defp generate_session_id do
     <<a::32, b::16, c::16, d::16, e::48>> = :crypto.strong_rand_bytes(16)

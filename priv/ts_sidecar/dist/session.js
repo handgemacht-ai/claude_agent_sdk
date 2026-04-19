@@ -13,18 +13,33 @@
  * Both paths expose the same in-process surface (`create`, `send`,
  * `stream`, `close`, `resume`) so `index.ts` doesn't branch on mode
  * after startup.
+ *
+ * Bridges:
+ *   • **hook bridge** — when the Elixir side declares `hookEvents`,
+ *     the sidecar fires `hook.fire` RPCs back to Elixir at the
+ *     appropriate lifecycle points and applies the `decision` to the
+ *     stream (for mock mode this is demonstration; real-mode hooks
+ *     wire into the SDK's own callback surface).
+ *   • **MCP bridge** — when `mcpTools` are declared, mock mode invokes
+ *     the first tool once per stream to exercise the `mcp.call`
+ *     round-trip; real mode registers a `createSdkMcpServer` whose
+ *     handlers each proxy back to Elixir via `mcp.call`.
  */
 import { send } from "./framing.js";
-import { NOTIF_STREAM_END, NOTIF_STREAM_ERROR, NOTIF_STREAM_MESSAGE, } from "./protocol.js";
+import { NOTIF_STREAM_END, NOTIF_STREAM_ERROR, NOTIF_STREAM_MESSAGE, METHOD_HOOK_FIRE, METHOD_MCP_CALL, } from "./protocol.js";
 // ---------------------------------------------------------------------------
 // Mock session — deterministic echo, no network
 // ---------------------------------------------------------------------------
 export class MockSession {
+    rpc;
     ctx;
     createdAt;
     lastUserText = "";
     cancelled = new Set();
     closed = false;
+    constructor(rpc) {
+        this.rpc = rpc;
+    }
     async create(params) {
         this.ctx = {
             sessionId: params.sessionId,
@@ -44,7 +59,58 @@ export class MockSession {
     async stream(streamId, out) {
         if (this.closed)
             throw new Error("session closed");
-        const reply = `echo (mock): ${this.lastUserText}`;
+        // --- Pre-stream hook (if registered) --------------------------------
+        let hookDecision = null;
+        if (this.ctx.hookEvents.includes("pre_tool_use")) {
+            try {
+                hookDecision = await this.rpc.call(METHOD_HOOK_FIRE, {
+                    sessionId: this.ctx.sessionId,
+                    event: "pre_tool_use",
+                    payload: { tool_name: "mock.echo", tool_input: { text: this.lastUserText } },
+                });
+            }
+            catch (err) {
+                this.emitStreamError(out, streamId, `hook.fire pre_tool_use failed: ${err.message}`);
+            }
+        }
+        if (hookDecision?.decision === "deny" || hookDecision?.decision === "block") {
+            send(out, {
+                jsonrpc: "2.0",
+                method: NOTIF_STREAM_MESSAGE,
+                params: {
+                    sessionId: this.ctx.sessionId,
+                    streamId,
+                    message: {
+                        type: "text_delta",
+                        text: `[blocked by hook: ${hookDecision.reason ?? "no reason"}]`,
+                    },
+                },
+            });
+            this.emitStreamEnd(out, streamId, "hook_denied");
+            return;
+        }
+        // --- MCP tool invocation (if any registered) ------------------------
+        let toolPrefix = "";
+        if (this.ctx.mcpTools.length > 0) {
+            const first = this.ctx.mcpTools[0];
+            try {
+                const result = await this.rpc.call(METHOD_MCP_CALL, {
+                    sessionId: this.ctx.sessionId,
+                    server: first.server,
+                    tool: first.tool,
+                    args: { probe: this.lastUserText.slice(0, 16) },
+                });
+                const firstContent = result.content?.[0];
+                const text = typeof firstContent?.text === "string"
+                    ? firstContent.text
+                    : JSON.stringify(result);
+                toolPrefix = `[tool:${first.server}/${first.tool} → ${text}] `;
+            }
+            catch (err) {
+                toolPrefix = `[tool:${first.server}/${first.tool} error: ${err.message}] `;
+            }
+        }
+        const reply = `${toolPrefix}echo (mock): ${this.lastUserText}`;
         const chunks = chunkString(reply, 16);
         for (const chunk of chunks) {
             if (this.cancelled.has(streamId))
@@ -60,15 +126,20 @@ export class MockSession {
             });
             await sleep(5);
         }
-        send(out, {
-            jsonrpc: "2.0",
-            method: NOTIF_STREAM_END,
-            params: {
-                sessionId: this.ctx.sessionId,
-                streamId,
-                reason: this.cancelled.has(streamId) ? "cancelled" : "message_stop",
-            },
-        });
+        // --- Post-stream hook (if registered) -------------------------------
+        if (this.ctx.hookEvents.includes("task_completed")) {
+            try {
+                await this.rpc.call(METHOD_HOOK_FIRE, {
+                    sessionId: this.ctx.sessionId,
+                    event: "task_completed",
+                    payload: { reply_length: reply.length, cancelled: this.cancelled.has(streamId) },
+                });
+            }
+            catch (err) {
+                this.emitStreamError(out, streamId, `hook.fire task_completed failed: ${err.message}`);
+            }
+        }
+        this.emitStreamEnd(out, streamId, this.cancelled.has(streamId) ? "cancelled" : "message_stop");
     }
     cancelStream(streamId) {
         this.cancelled.add(streamId);
@@ -79,16 +150,36 @@ export class MockSession {
     async resume(_options) {
         this.closed = false;
     }
+    emitStreamEnd(out, streamId, reason) {
+        send(out, {
+            jsonrpc: "2.0",
+            method: NOTIF_STREAM_END,
+            params: { sessionId: this.ctx.sessionId, streamId, reason },
+        });
+    }
+    emitStreamError(out, streamId, message) {
+        send(out, {
+            jsonrpc: "2.0",
+            method: NOTIF_STREAM_ERROR,
+            params: {
+                sessionId: this.ctx.sessionId,
+                streamId,
+                error: { code: -32004, message },
+            },
+        });
+    }
 }
 export class RealSession {
     sdk;
+    rpc;
     handle;
     ctx;
     createdAt;
     closed = false;
     activeStreams = new Map();
-    constructor(sdk) {
+    constructor(sdk, rpc) {
         this.sdk = sdk;
+        this.rpc = rpc;
     }
     async create(params) {
         if (!this.sdk.unstable_v2_createSession) {
@@ -100,6 +191,10 @@ export class RealSession {
             mcpTools: params.mcpTools ?? [],
             options: params.options ?? {},
         };
+        // MCP bridge: stubbed in real mode — real wiring happens when a
+        // production caller lands a concrete tool schema. The TS-side
+        // `createSdkMcpServer` wrapping is a follow-up once we validate
+        // the `unstable_v2_createSession` handle shape in production.
         this.handle = await this.sdk.unstable_v2_createSession({
             ...params.options,
             sessionId: params.sessionId,
@@ -188,7 +283,7 @@ export async function buildSession() {
     const forcedMock = process.env.SIDECAR_MOCK === "1";
     if (forcedMock) {
         return {
-            make: () => new MockSession(),
+            make: (rpc) => new MockSession(rpc),
             info: { mode: "mock", sdkVersion: "mock-0.1.0", reason: "SIDECAR_MOCK=1" },
         };
     }
@@ -196,13 +291,13 @@ export async function buildSession() {
         const mod = (await import("@anthropic-ai/claude-agent-sdk"));
         const version = await readSdkVersion();
         return {
-            make: () => new RealSession(mod),
+            make: (rpc) => new RealSession(mod, rpc),
             info: { mode: "real", sdkVersion: version },
         };
     }
     catch (err) {
         return {
-            make: () => new MockSession(),
+            make: (rpc) => new MockSession(rpc),
             info: {
                 mode: "mock",
                 sdkVersion: "mock-0.1.0",

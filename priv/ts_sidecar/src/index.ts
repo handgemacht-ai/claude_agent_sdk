@@ -3,14 +3,16 @@
  * Sidecar main loop.
  *
  * One Node process, many logical sessions. Reads JSON-RPC frames from
- * stdin, dispatches by method, writes responses and notifications to
- * stdout. Every session operation carries a `sessionId` — the Elixir
- * side owns that identifier and the sidecar stores the session handle
- * in `sessions: Map<sessionId, SessionEnvelope>`.
+ * stdin, dispatches requests by method, routes responses to the
+ * outbound RPC client, writes notifications and responses to stdout.
+ * Every session operation carries a `sessionId` — the Elixir side
+ * owns that identifier; the sidecar stores session handles in
+ * `sessions: Map<sessionId, SessionEnvelope>`.
  */
 
 import { readFrames, send } from "./framing.js";
-import { buildSession, type SessionEnvelope, type ModeInfo } from "./session.js";
+import { buildSession, type SessionEnvelope } from "./session.js";
+import { OutboundRpc } from "./rpc.js";
 import {
   ERROR_INTERNAL,
   ERROR_INVALID_PARAMS,
@@ -27,18 +29,19 @@ import {
   NOTIF_LOG,
   NOTIF_SIDECAR_READY,
   PROTOCOL_VERSION,
-  type SessionCreateParams,
-  type SessionSendParams,
-  type SessionStreamStartParams,
-  type SessionStreamCancelParams,
   type SessionCloseParams,
+  type SessionCreateParams,
   type SessionResumeParams,
+  type SessionSendParams,
+  type SessionStreamCancelParams,
+  type SessionStreamStartParams,
 } from "./protocol.js";
 
 const SIDECAR_VERSION = "0.1.0";
 
 async function main(): Promise<void> {
   const { make, info } = await buildSession();
+  const rpc = new OutboundRpc(process.stdout);
   const sessions = new Map<string, SessionEnvelope>();
 
   send(process.stdout, {
@@ -60,6 +63,11 @@ async function main(): Promise<void> {
 
   for await (const frame of readFrames(process.stdin)) {
     const v = frame.value as Record<string, unknown>;
+
+    // Responses to our own outbound calls (hook.fire, mcp.call) are
+    // absorbed here and never hit the dispatcher.
+    if (rpc.feed(v)) continue;
+
     const isRequest = typeof v.id !== "undefined" && typeof v.method === "string";
     if (!isRequest) continue;
 
@@ -67,35 +75,23 @@ async function main(): Promise<void> {
     const method = v.method as string;
     const params = (v.params ?? {}) as Record<string, unknown>;
 
-    try {
-      const result = await dispatch(method, params, { sessions, make, log });
-      send(process.stdout, { jsonrpc: "2.0", id, result });
-      if (method === METHOD_SHUTDOWN) {
-        shuttingDown = true;
-        break;
-      }
-    } catch (err) {
-      const e = err as { code?: number; message?: string; data?: unknown };
-      send(process.stdout, {
-        jsonrpc: "2.0",
-        id,
-        error: {
-          code: typeof e.code === "number" ? e.code : ERROR_INTERNAL,
-          message: e.message ?? String(err),
-          data: e.data,
-        },
-      });
-    }
+    // Dispatch the request in a fresh microtask so long-running calls
+    // (e.g. session.create under a slow resume) don't block the reader.
+    void handleRequest(id, method, params, { sessions, make, rpc, log }).then((shouldShutdown) => {
+      if (shouldShutdown) shuttingDown = true;
+    });
+
+    if (shuttingDown) break;
   }
 
-  // Drain: close any live sessions so downstream resources are freed.
-  for (const [_sid, env] of sessions) {
+  for (const [, env] of sessions) {
     try {
       await env.close();
     } catch {
       /* ignore */
     }
   }
+  rpc.drain("sidecar shutting down");
 
   if (shuttingDown) {
     process.exit(0);
@@ -104,8 +100,34 @@ async function main(): Promise<void> {
 
 interface DispatchCtx {
   sessions: Map<string, SessionEnvelope>;
-  make: () => SessionEnvelope;
+  make: (rpc: OutboundRpc) => SessionEnvelope;
+  rpc: OutboundRpc;
   log: (level: string, message: string, extra?: Record<string, unknown>) => void;
+}
+
+async function handleRequest(
+  id: number | string,
+  method: string,
+  params: Record<string, unknown>,
+  ctx: DispatchCtx,
+): Promise<boolean> {
+  try {
+    const result = await dispatch(method, params, ctx);
+    send(process.stdout, { jsonrpc: "2.0", id, result });
+    return method === METHOD_SHUTDOWN;
+  } catch (err) {
+    const e = err as { code?: number; message?: string; data?: unknown };
+    send(process.stdout, {
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code: typeof e.code === "number" ? e.code : ERROR_INTERNAL,
+        message: e.message ?? String(err),
+        data: e.data,
+      },
+    });
+    return false;
+  }
 }
 
 async function dispatch(
@@ -124,9 +146,11 @@ async function dispatch(
       const p = params as unknown as SessionCreateParams;
       requireSessionId(p);
       if (ctx.sessions.has(p.sessionId)) {
-        throw rpcError(ERROR_INVALID_PARAMS, "sessionId already exists", { sessionId: p.sessionId });
+        throw rpcError(ERROR_INVALID_PARAMS, "sessionId already exists", {
+          sessionId: p.sessionId,
+        });
       }
-      const env = ctx.make();
+      const env = ctx.make(ctx.rpc);
       const result = await env.create(p);
       ctx.sessions.set(p.sessionId, env);
       ctx.log("info", "session created", { sessionId: p.sessionId });
@@ -143,7 +167,6 @@ async function dispatch(
     case METHOD_SESSION_STREAM_START: {
       const p = params as unknown as SessionStreamStartParams;
       const env = lookup(ctx, p.sessionId);
-      // Fire-and-forget: notifications emit inside env.stream().
       env.stream(p.streamId, process.stdout).catch((err) => {
         ctx.log("error", "stream failed", {
           sessionId: p.sessionId,

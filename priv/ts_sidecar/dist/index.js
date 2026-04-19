@@ -3,17 +3,20 @@
  * Sidecar main loop.
  *
  * One Node process, many logical sessions. Reads JSON-RPC frames from
- * stdin, dispatches by method, writes responses and notifications to
- * stdout. Every session operation carries a `sessionId` — the Elixir
- * side owns that identifier and the sidecar stores the session handle
- * in `sessions: Map<sessionId, SessionEnvelope>`.
+ * stdin, dispatches requests by method, routes responses to the
+ * outbound RPC client, writes notifications and responses to stdout.
+ * Every session operation carries a `sessionId` — the Elixir side
+ * owns that identifier; the sidecar stores session handles in
+ * `sessions: Map<sessionId, SessionEnvelope>`.
  */
 import { readFrames, send } from "./framing.js";
 import { buildSession } from "./session.js";
+import { OutboundRpc } from "./rpc.js";
 import { ERROR_INTERNAL, ERROR_INVALID_PARAMS, ERROR_METHOD_NOT_FOUND, ERROR_SESSION_UNKNOWN, METHOD_PING, METHOD_SESSION_CLOSE, METHOD_SESSION_CREATE, METHOD_SESSION_RESUME, METHOD_SESSION_SEND, METHOD_SESSION_STREAM_CANCEL, METHOD_SESSION_STREAM_START, METHOD_SHUTDOWN, NOTIF_LOG, NOTIF_SIDECAR_READY, PROTOCOL_VERSION, } from "./protocol.js";
 const SIDECAR_VERSION = "0.1.0";
 async function main() {
     const { make, info } = await buildSession();
+    const rpc = new OutboundRpc(process.stdout);
     const sessions = new Map();
     send(process.stdout, {
         jsonrpc: "2.0",
@@ -31,35 +34,26 @@ async function main() {
     let shuttingDown = false;
     for await (const frame of readFrames(process.stdin)) {
         const v = frame.value;
+        // Responses to our own outbound calls (hook.fire, mcp.call) are
+        // absorbed here and never hit the dispatcher.
+        if (rpc.feed(v))
+            continue;
         const isRequest = typeof v.id !== "undefined" && typeof v.method === "string";
         if (!isRequest)
             continue;
         const id = v.id;
         const method = v.method;
         const params = (v.params ?? {});
-        try {
-            const result = await dispatch(method, params, { sessions, make, log });
-            send(process.stdout, { jsonrpc: "2.0", id, result });
-            if (method === METHOD_SHUTDOWN) {
+        // Dispatch the request in a fresh microtask so long-running calls
+        // (e.g. session.create under a slow resume) don't block the reader.
+        void handleRequest(id, method, params, { sessions, make, rpc, log }).then((shouldShutdown) => {
+            if (shouldShutdown)
                 shuttingDown = true;
-                break;
-            }
-        }
-        catch (err) {
-            const e = err;
-            send(process.stdout, {
-                jsonrpc: "2.0",
-                id,
-                error: {
-                    code: typeof e.code === "number" ? e.code : ERROR_INTERNAL,
-                    message: e.message ?? String(err),
-                    data: e.data,
-                },
-            });
-        }
+        });
+        if (shuttingDown)
+            break;
     }
-    // Drain: close any live sessions so downstream resources are freed.
-    for (const [_sid, env] of sessions) {
+    for (const [, env] of sessions) {
         try {
             await env.close();
         }
@@ -67,8 +61,29 @@ async function main() {
             /* ignore */
         }
     }
+    rpc.drain("sidecar shutting down");
     if (shuttingDown) {
         process.exit(0);
+    }
+}
+async function handleRequest(id, method, params, ctx) {
+    try {
+        const result = await dispatch(method, params, ctx);
+        send(process.stdout, { jsonrpc: "2.0", id, result });
+        return method === METHOD_SHUTDOWN;
+    }
+    catch (err) {
+        const e = err;
+        send(process.stdout, {
+            jsonrpc: "2.0",
+            id,
+            error: {
+                code: typeof e.code === "number" ? e.code : ERROR_INTERNAL,
+                message: e.message ?? String(err),
+                data: e.data,
+            },
+        });
+        return false;
     }
 }
 async function dispatch(method, params, ctx) {
@@ -81,9 +96,11 @@ async function dispatch(method, params, ctx) {
             const p = params;
             requireSessionId(p);
             if (ctx.sessions.has(p.sessionId)) {
-                throw rpcError(ERROR_INVALID_PARAMS, "sessionId already exists", { sessionId: p.sessionId });
+                throw rpcError(ERROR_INVALID_PARAMS, "sessionId already exists", {
+                    sessionId: p.sessionId,
+                });
             }
-            const env = ctx.make();
+            const env = ctx.make(ctx.rpc);
             const result = await env.create(p);
             ctx.sessions.set(p.sessionId, env);
             ctx.log("info", "session created", { sessionId: p.sessionId });
@@ -98,7 +115,6 @@ async function dispatch(method, params, ctx) {
         case METHOD_SESSION_STREAM_START: {
             const p = params;
             const env = lookup(ctx, p.sessionId);
-            // Fire-and-forget: notifications emit inside env.stream().
             env.stream(p.streamId, process.stdout).catch((err) => {
                 ctx.log("error", "stream failed", {
                     sessionId: p.sessionId,
