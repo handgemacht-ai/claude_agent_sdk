@@ -11,6 +11,7 @@
  *     method listed here can be invoked via `session.control` RPC.
  */
 import { createRequire } from "node:module";
+import { z } from "zod";
 import { send } from "./framing.js";
 import { NOTIF_SESSION_CLOSED, NOTIF_SESSION_ERROR, NOTIF_SESSION_MESSAGE, METHOD_CAN_USE_TOOL, METHOD_HOOK_FIRE, METHOD_MCP_CALL, } from "./protocol.js";
 export const CONTROL_METHODS = [
@@ -263,7 +264,7 @@ export class QuerySession {
         }
         const servers = {};
         for (const [serverName, specs] of byServer) {
-            const sdkTools = specs.map((spec) => this.sdk.tool(spec.name, spec.description, spec.inputSchema ?? {}, async (args) => this.proxyMcpCall(serverName, spec.name, args)));
+            const sdkTools = specs.map((spec) => this.sdk.tool(spec.name, spec.description, jsonSchemaToZodShape(spec.inputSchema), async (args) => this.proxyMcpCall(serverName, spec.name, args)));
             servers[serverName] = this.sdk.createSdkMcpServer({
                 name: serverName,
                 tools: sdkTools,
@@ -286,6 +287,31 @@ function mergeHooks(a, b) {
         out[k] = [...(out[k] ?? []), ...v];
     }
     return out;
+}
+/**
+ * Convert a JSON-Schema object into a permissive Zod raw shape.
+ *
+ * The SDK's `tool()` requires a Zod schema or raw shape (a plain object
+ * whose values are Zod types) — an empty object is accepted as a raw
+ * shape with no fields, but any other JSON-Schema object is rejected
+ * with "inputSchema must be a Zod schema or raw shape, received an
+ * unrecognized object".
+ *
+ * Elixir is authoritative for validation, so we only need a shape the
+ * SDK will accept. Every declared property becomes `z.unknown()`.
+ * Schemas without a usable `properties` map collapse to `{}`.
+ */
+export function jsonSchemaToZodShape(schema) {
+    if (!schema || typeof schema !== "object")
+        return {};
+    const properties = schema.properties;
+    if (!properties || typeof properties !== "object")
+        return {};
+    const shape = {};
+    for (const key of Object.keys(properties)) {
+        shape[key] = z.unknown();
+    }
+    return shape;
 }
 export async function buildSession() {
     const mod = (await import("@anthropic-ai/claude-agent-sdk"));

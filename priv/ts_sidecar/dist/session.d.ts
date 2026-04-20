@@ -11,6 +11,7 @@
  *     method listed here can be invoked via `session.control` RPC.
  */
 import type { Writable } from "node:stream";
+import { type ZodRawShape } from "zod";
 import { OutboundRpc } from "./rpc.js";
 import { type SessionCreateParams, type SessionCreateResult } from "./protocol.js";
 type SdkUserMessage = {
@@ -104,6 +105,20 @@ export declare class QuerySession {
     private makeMcpServers;
     private proxyMcpCall;
 }
+/**
+ * Convert a JSON-Schema object into a permissive Zod raw shape.
+ *
+ * The SDK's `tool()` requires a Zod schema or raw shape (a plain object
+ * whose values are Zod types) — an empty object is accepted as a raw
+ * shape with no fields, but any other JSON-Schema object is rejected
+ * with "inputSchema must be a Zod schema or raw shape, received an
+ * unrecognized object".
+ *
+ * Elixir is authoritative for validation, so we only need a shape the
+ * SDK will accept. Every declared property becomes `z.unknown()`.
+ * Schemas without a usable `properties` map collapse to `{}`.
+ */
+export declare function jsonSchemaToZodShape(schema: Record<string, unknown> | undefined | null): ZodRawShape;
 export interface ModeInfo {
     sdkVersion: string;
 }

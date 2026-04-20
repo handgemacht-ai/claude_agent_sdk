@@ -13,6 +13,7 @@
 
 import type { Writable } from "node:stream";
 import { createRequire } from "node:module";
+import { z, type ZodRawShape } from "zod";
 import { send } from "./framing.js";
 import { OutboundRpc } from "./rpc.js";
 import {
@@ -380,7 +381,7 @@ export class QuerySession {
         this.sdk.tool(
           spec.name,
           spec.description,
-          spec.inputSchema ?? {},
+          jsonSchemaToZodShape(spec.inputSchema),
           async (args) => this.proxyMcpCall(serverName, spec.name, args),
         ),
       );
@@ -415,6 +416,32 @@ function mergeHooks(
     out[k] = [...(out[k] ?? []), ...v];
   }
   return out;
+}
+
+/**
+ * Convert a JSON-Schema object into a permissive Zod raw shape.
+ *
+ * The SDK's `tool()` requires a Zod schema or raw shape (a plain object
+ * whose values are Zod types) — an empty object is accepted as a raw
+ * shape with no fields, but any other JSON-Schema object is rejected
+ * with "inputSchema must be a Zod schema or raw shape, received an
+ * unrecognized object".
+ *
+ * Elixir is authoritative for validation, so we only need a shape the
+ * SDK will accept. Every declared property becomes `z.unknown()`.
+ * Schemas without a usable `properties` map collapse to `{}`.
+ */
+export function jsonSchemaToZodShape(
+  schema: Record<string, unknown> | undefined | null,
+): ZodRawShape {
+  if (!schema || typeof schema !== "object") return {};
+  const properties = (schema as { properties?: unknown }).properties;
+  if (!properties || typeof properties !== "object") return {};
+  const shape: Record<string, ReturnType<typeof z.unknown>> = {};
+  for (const key of Object.keys(properties as Record<string, unknown>)) {
+    shape[key] = z.unknown();
+  }
+  return shape as ZodRawShape;
 }
 
 export interface ModeInfo {
