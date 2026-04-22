@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-04-22
+
+### Fixed
+
+- TS sidecar Node dependencies (including `zod`) are now installed
+  automatically when consumer applications compile the SDK. A new Mix
+  compiler (`:claude_agent_sdk_sidecar`) wraps `mix
+  claude_agent_sdk.install_sidecar` idempotently and is wired into the
+  SDK's `compilers:` pipeline. Previously the install task existed but
+  was never invoked, so `deps/claude_agent_sdk/priv/ts_sidecar/dist/*.js`
+  crashed at runtime with `ERR_MODULE_NOT_FOUND: Cannot find package
+  'zod'`.
+
 ## [0.17.0] - 2026-04-06
 
 ### Added

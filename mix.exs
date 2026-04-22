@@ -2,7 +2,7 @@ defmodule ClaudeAgentSdk.MixProject do
   use Mix.Project
 
   @app :claude_agent_sdk
-  @version "0.17.0"
+  @version "0.17.1"
   @source_url "https://github.com/nshkrdotcom/claude_agent_sdk"
   @homepage_url "https://hex.pm/packages/claude_agent_sdk"
   @docs_url "https://hexdocs.pm/claude_agent_sdk"
@@ -13,6 +13,7 @@ defmodule ClaudeAgentSdk.MixProject do
       version: @version,
       elixir: "~> 1.14",
       elixirc_paths: elixirc_paths(Mix.env()),
+      compilers: Mix.compilers() ++ [:claude_agent_sdk_sidecar],
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       description: description(),
